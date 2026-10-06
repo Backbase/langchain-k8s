@@ -25,12 +25,14 @@ Exported symbols
 ~~~~~~~~~~~~~~~~
 
 - :class:`KubernetesSandbox` — Main sandbox backend class.
+- :class:`SandboxdBackend` — Sandboxd backend whose file tools use the
+  REST filesystem API.
 - :func:`create_kubernetes_sandbox` — Get-or-create factory for
   thread-scoped sandboxes.
 - ``__version__`` — Package version string (PEP 440).
 """
 
 from langchain_k8s._version import __version__
-from langchain_k8s.sandbox import KubernetesSandbox, create_kubernetes_sandbox
+from langchain_k8s.sandbox import KubernetesSandbox, SandboxdBackend, create_kubernetes_sandbox
 
-__all__ = ["KubernetesSandbox", "create_kubernetes_sandbox", "__version__"]
+__all__ = ["KubernetesSandbox", "SandboxdBackend", "create_kubernetes_sandbox", "__version__"]

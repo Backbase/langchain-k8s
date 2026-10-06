@@ -13,6 +13,8 @@ This creates a Kind cluster named ``langchain-k8s`` with:
 3. ``python-sandbox-template`` SandboxTemplate
 4. ``python-sandbox-pool`` SandboxWarmPool — what claims actually
    reference; the pool is what points at the template
+5. ``sandboxd-template`` and ``sandboxd-pool`` — shell execute only;
+   the stock image has no ``python3``
 
 The ``python-runtime-sandbox`` image is *not* preloaded into Kind; the node
 pulls it from ``registry.k8s.io`` on first use, so the first test to create a
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import posixpath
 import threading
+import uuid
 from collections.abc import Generator
 
 import pytest
@@ -491,8 +494,8 @@ class TestVirtualMode:
             assert results[0].content is not None
             assert b"download me" in results[0].content
 
-    def test_ls_info_resolves_path(self) -> None:
-        """ls_info() resolves the virtual path under root_dir."""
+    def test_ls_resolves_path(self) -> None:
+        """ls() resolves the virtual path under root_dir."""
         with KubernetesSandbox(
             warmpool_name=WARMPOOL,
             namespace=NAMESPACE,
@@ -500,9 +503,11 @@ class TestVirtualMode:
             root_dir="/tmp/vfs-ls",
         ) as sb:
             sb.execute("mkdir -p /tmp/vfs-ls/sub && touch /tmp/vfs-ls/sub/a.txt /tmp/vfs-ls/sub/b.txt")
-            entries = sb.ls_info("/sub")
+            result = sb.ls("/sub")
+            assert result.error is None
+            assert result.entries is not None
             # FileInfo is a TypedDict with "path" key; extract basenames.
-            names = [posixpath.basename(e["path"]) for e in entries]
+            names = [posixpath.basename(e["path"]) for e in result.entries]
             assert "a.txt" in names
             assert "b.txt" in names
 
@@ -695,3 +700,120 @@ class TestEcosystemStandardMode:
             assert "reused" in resp2.output
         finally:
             client.delete_sandbox(claim, NAMESPACE)
+
+
+# ---------------------------------------------------------------------------
+# Environment variables
+# ---------------------------------------------------------------------------
+
+
+class TestEnv:
+    def test_env_is_visible_in_the_container(self) -> None:
+        """spec.env reaches the container. Setting it cold-starts the pod."""
+        with KubernetesSandbox(
+            warmpool_name=WARMPOOL,
+            namespace=NAMESPACE,
+            env={"LANGCHAIN_K8S_IT": "from-constructor"},
+        ) as sb:
+            resp = sb.execute("printenv LANGCHAIN_K8S_IT")
+            assert resp.exit_code == 0
+            assert resp.output.strip() == "from-constructor"
+
+    def test_factory_env_is_visible_in_the_container(self) -> None:
+        """create_kubernetes_sandbox forwards env onto the claim it creates."""
+        from k8s_agent_sandbox import SandboxClient
+        from k8s_agent_sandbox.models import SandboxLocalTunnelConnectionConfig
+
+        client = SandboxClient(
+            connection_config=SandboxLocalTunnelConnectionConfig(),
+        )
+        claim = f"it-env-{uuid.uuid4().hex[:12]}"
+        backend: KubernetesSandbox | None = None
+        try:
+            backend = create_kubernetes_sandbox(
+                client=client,
+                claim_name=claim,
+                warmpool_name=WARMPOOL,
+                namespace=NAMESPACE,
+                env={"LANGCHAIN_K8S_IT": "from-factory"},
+            )
+            resp = backend.execute("printenv LANGCHAIN_K8S_IT")
+            assert resp.exit_code == 0
+            assert resp.output.strip() == "from-factory"
+        finally:
+            if backend is not None:
+                backend.stop()
+                client.delete_sandbox(claim, NAMESPACE)
+
+
+# ---------------------------------------------------------------------------
+# Large command output
+# ---------------------------------------------------------------------------
+
+
+class TestCaptureOffload:
+    def test_threshold_decides_inline_or_file(self) -> None:
+        """Output under the inline budget stays inline; output over it is left in the sandbox."""
+        with KubernetesSandbox(
+            warmpool_name=WARMPOOL,
+            namespace=NAMESPACE,
+            enable_capture_offload=True,
+        ) as sb:
+            small = sb.execute_with_offload(
+                "echo short-offload",
+                "/tmp/large_tool_results/small",
+                max_inline_bytes=10_000,
+            )
+            assert small.offloaded is False
+            assert small.response.exit_code == 0
+            assert "short-offload" in small.response.output
+
+            large = sb.execute_with_offload(
+                "echo hello-offload",
+                "/tmp/large_tool_results/large",
+                max_inline_bytes=1,
+            )
+            assert large.offloaded is True
+            assert large.response.exit_code == 0
+            saved = sb.execute("cat /tmp/large_tool_results/large")
+            assert saved.exit_code == 0
+            assert "hello-offload" in saved.output
+
+    async def test_virtual_mode_capture_is_readable(self) -> None:
+        """The capture file is written where a later virtual-mode read looks for it."""
+        with KubernetesSandbox(
+            warmpool_name=WARMPOOL,
+            namespace=NAMESPACE,
+            enable_capture_offload=True,
+            virtual_mode=True,
+            root_dir="/tmp",
+        ) as sb:
+            result = sb.execute_with_offload(
+                "echo virtual-offload",
+                "/large_tool_results/it-virtual",
+                max_inline_bytes=1,
+            )
+            assert result.offloaded is True
+            assert result.response.exit_code == 0
+
+            saved = sb.execute("cat /tmp/large_tool_results/it-virtual")
+            assert saved.exit_code == 0
+            assert "virtual-offload" in saved.output
+            doubled = sb.execute("test ! -e /tmp/tmp/large_tool_results/it-virtual && echo absent")
+            assert doubled.exit_code == 0
+            assert "absent" in doubled.output
+
+            content = sb.read("/large_tool_results/it-virtual")
+            assert content.error is None
+            assert content.file_data is not None
+            assert "virtual-offload" in content.file_data["content"]
+
+            async_result = await sb.aexecute_with_offload(
+                "echo async-offload",
+                "/large_tool_results/it-async",
+                max_inline_bytes=1,
+            )
+            assert async_result.offloaded is True
+            assert async_result.response.exit_code == 0
+            async_saved = sb.execute("cat /tmp/large_tool_results/it-async")
+            assert "async-offload" in async_saved.output

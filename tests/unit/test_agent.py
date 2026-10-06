@@ -217,6 +217,51 @@ class TestDeepAgentExecuteAndFiles:
         backend.stop()
 
 
+class TestExecuteOffload:
+    """Oversized execute output comes back as a preview plus a read_file pointer."""
+
+    def test_tool_message_carries_preview_and_pointer(self) -> None:
+        mock = make_mock_client(
+            run_result=FakeExecutionResult(
+                stdout="__DEEPAGENTS_EXEC_META__ 0 1 0 0\npreview of a huge command\n",
+                exit_code=0,
+            ),
+        )
+        model = FakeToolModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "execute",
+                            "args": {"command": "echo huge"},
+                            "id": "call_exec_offload",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="Read the saved output."),
+            ],
+        )
+        with patch("k8s_agent_sandbox.SandboxClient", return_value=mock):
+            backend = KubernetesSandbox(
+                warmpool_name="test-tpl",
+                namespace="test-ns",
+                enable_capture_offload=True,
+            )
+            agent = create_agent(model, middleware=[FilesystemMiddleware(backend=backend)])
+            result = agent.invoke({"messages": [HumanMessage(content="Run a huge command")]})
+
+        tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+        assert tool_msgs
+        content = tool_msgs[0].content
+        assert "preview of a huge command" in content
+        assert "read_file" in content
+        assert "/large_tool_results/" in content
+        cmd = mock._mock_sandbox_handle.commands.run.call_args[0][0]
+        assert "/large_tool_results/" in cmd
+
+
 class TestDeepAgentLifecycle:
     """Agent creation and teardown with the backend."""
 

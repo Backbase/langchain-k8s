@@ -27,19 +27,20 @@ When working in this repository, read the OpenWiki quickstart first, then follow
 **Key concepts:**
 
 - `KubernetesSandbox` — the main class; wraps the `k8s_agent_sandbox.SandboxClient`
+- `SandboxdBackend` — subclass whose file tools use sandboxd's REST filesystem API; `execute` stays gRPC
 - `create_kubernetes_sandbox` — module-level get-or-create factory keyed on `claim_name`; the production entry point for thread-scoped sandboxes
 - **Handle mode** (`sandbox=` passed) vs **config-based mode** (`warmpool_name=` passed) — decides who owns the Kubernetes resource lifecycle
 - **Connection modes** — production (Gateway API), development (auto port-forward), advanced (direct `api_url`), in-cluster
 - `proxy.py` — monkey-patches a bug in the kubernetes Python client's NO_PROXY handling
 
-Public API is exactly `__all__ = ["KubernetesSandbox", "create_kubernetes_sandbox", "__version__"]`.
+Public API is exactly `__all__ = ["KubernetesSandbox", "SandboxdBackend", "create_kubernetes_sandbox", "__version__"]`.
 
 ## Repository Layout
 
 ```
 src/langchain_k8s/
-  __init__.py        # Public API: KubernetesSandbox, create_kubernetes_sandbox, __version__
-  sandbox.py         # KubernetesSandbox + create_kubernetes_sandbox — all the logic
+  __init__.py        # Public API: KubernetesSandbox, SandboxdBackend, create_kubernetes_sandbox, __version__
+  sandbox.py         # KubernetesSandbox, SandboxdBackend, create_kubernetes_sandbox — all the logic
   proxy.py           # k8s client NO_PROXY monkey-patch (quarantined infrastructure)
   _version.py        # Version constant — the single source of truth for the package version
 
@@ -59,7 +60,7 @@ scripts/             # kind-setup.sh / kind-teardown.sh
 
 ## Architecture
 
-**This package is a backend adapter, not an agent.** There is no custom Runnable, no LangChain Tool, no agent loop, and no client/server split here. `deepagents.create_deep_agent(backend=...)` owns the tools and the loop; `KubernetesSandbox` (`sandbox.py:45`) only supplies `execute()`, `upload_files()`, `download_files()` and the `id` property.
+**This package is a backend adapter, not an agent.** There is no custom Runnable, no LangChain Tool, no agent loop, and no client/server split here. `deepagents.create_deep_agent(backend=...)` owns the tools and the loop; `KubernetesSandbox` (`sandbox.py:52`) only supplies `execute()`, `upload_files()`, `download_files()` and the `id` property.
 
 `BaseSandbox` synthesises `read`/`write`/`edit`/`ls`/`grep`/`glob` on top of the single `execute()` primitive by shipping base64-encoded `python3 -c` scripts into the container. `KubernetesSandbox` overrides those six only to apply path policy, then delegates via `super()`. Everything in `src/` is **synchronous** — `pytest-asyncio` and `asyncio_mode = "auto"` exist only because the agent tests await LangGraph.
 
@@ -74,7 +75,7 @@ execute()  →  _ensure_sandbox()      →  _run()  →  _run_raw()
 
 ### Two constructor modes
 
-Selected by `self._owns_lifecycle = sandbox is None` (`sandbox.py:303`):
+Selected by `self._owns_lifecycle = sandbox is None` (`sandbox.py:383`):
 
 | | Handle mode | Config-based mode |
 | --- | --- | --- |
@@ -87,7 +88,7 @@ Selected by `self._owns_lifecycle = sandbox is None` (`sandbox.py:303`):
 
 ### Connection-mode resolution
 
-Strict precedence chain in `_create_client` (`sandbox.py:1073`):
+Strict precedence chain in `_create_client` (`sandbox.py:1319`):
 
 `connection_config` → `api_url` (`SandboxDirectConnectionConfig`) → `gateway_name` (`SandboxGatewayConnectionConfig`) → default (`SandboxLocalTunnelConnectionConfig`, i.e. automatic `kubectl port-forward`).
 
@@ -111,26 +112,32 @@ The unit of identity is the `SandboxClaim` name. Persist `claim_name`, pass it t
 **Invariants — breaking these breaks the package:**
 
 1. **`__init__` must never contact the cluster.** Enforced by `tests/unit/test_sandbox.py::TestConstruction::test_not_started_on_init`. All cluster work goes through `_ensure_sandbox()` under `self._lock`.
-2. **`_resolve_virtual_path` (`sandbox.py:892`) must stay idempotent.** `BaseSandbox.write` internally calls `self.upload_files()`, and both layers resolve. Break the already-resolved short-circuit and you silently get `/tmp/tmp/src/main.py`.
+2. **`_resolve_virtual_path` (`sandbox.py:1139`) must stay idempotent.** `BaseSandbox.write` internally calls `self.upload_files()`, and both layers resolve. Break the already-resolved short-circuit and you silently get `/tmp/tmp/src/main.py`.
 3. **`allow_prefixes` is checked against the _resolved_ path**, after virtual-mode resolution — never the caller-supplied path.
 4. **The `k8s_agent_sandbox` SDK is imported lazily inside function bodies**, plus `TYPE_CHECKING` at module scope. Keeps import cost down and keeps `test_imports.py` honest.
 
 **Gotchas — surprising but intended:**
 
-- **`reuse_sandbox=False` does not create ephemeral pods.** `self._reuse_sandbox` is read at exactly one place, `sandbox.py:467`, where it gates a single auto-reconnect-and-retry inside `execute()`. `start()`/`stop()` behave identically either way. Older prose in `README.md` and `openwiki/` claims per-invocation pod isolation — it does not exist.
+- **`reuse_sandbox=False` does not create ephemeral pods.** `self._reuse_sandbox` is read at exactly one place, `sandbox.py:557`, where it gates a single auto-reconnect-and-retry inside `execute()`. `start()`/`stop()` behave identically either way. Older prose in `README.md` and `openwiki/` claims per-invocation pod isolation — it does not exist.
 - **`allow_prefixes` and `virtual_mode` are tool-level only.** `execute("echo bad > /etc/passwd")` bypasses both. Real containment needs the pod `securityContext`.
 - **`allow_prefixes` normalisation appends a trailing slash**, so `["/tmp"]` permits `/tmp/x` but not the literal path `/tmp`.
 - **Policy passing ≠ writable.** `write`/`edit` sniff for `PermissionError` and emit a specific warning. `/tmp` is the safe default; `/workspace` needs a volume in the `SandboxTemplate` — an `emptyDir` mount for scratch, or `volume_claim_templates` on the claim plus a matching `volumeMounts` entry in the template for durable storage. Either way the template must do the mounting; a claim template only supplies the volume.
 - **Handle mode is one-shot.** After `stop()`, `_warmpool_name` and `_claim_name` are `None`, so a later `execute()` trips the `assert self._warmpool_name is not None` in `_ensure_sandbox`. The backend is not restartable.
 - **`max_output_size` truncation applies to every `_run_raw` call**, including the internal JSON-emitting scripts that `BaseSandbox.read`/`ls`/`glob` depend on. A large listing truncated mid-JSON surfaces as a parse error, not a clean truncation.
-- **`BaseSandbox.write` fails if the file already exists** — surprising for a method with that name.
+- **`BaseSandbox.write` overwrites an existing file.** deepagents 0.7 creates missing parents (`os.makedirs`) and then uploads, so a second `write()` to the same path succeeds. A `PermissionError` from that preflight still surfaces in `WriteResult.error` (the traceback contains `PermissionError:`), which is what the warning sniff matches.
+- **Async file methods must stay overridden.** deepagents 0.7 implements `aread`/`awrite`/`aedit`/`als`/`agrep`/`aglob` by calling `aexecute` directly, which skips the sync policy overrides. `KubernetesSandbox` routes each of them through `asyncio.to_thread(self.<sync>)`. `adelete`, `aupload_files`, `adownload_files` and `aexecute` already do that in the base class — dropping the override on any of the six re-opens `allow_prefixes` and `virtual_mode` for `ainvoke`.
+- **`delete` is policy-checked here, not in `BaseSandbox`.** The base implementation runs `rm -rf` through `execute()` with no path check. `KubernetesSandbox.delete` resolves the path and applies `allow_prefixes` first; `adelete` inherits that because the base class threads it.
 - **`id` returns a construction-time UUID until a handle exists**, even when `claim_name` was supplied. Use the `claim_name` property for persistence.
-- **`upload_files`/`download_files` deliberately bypass the SDK's native endpoints** (native `write()` only supports a fixed upload dir; `/download` is restricted to `/app`). Hence base64-over-shell. `_download_files_native` (`sandbox.py:828`) is currently unreachable — `download_files` always routes to `_download_files_shell`.
+- **`upload_files`/`download_files` deliberately bypass the SDK's native endpoints** (native `write()` only supports a fixed upload dir; `/download` is restricted to `/app`). Hence base64-over-shell. `_download_files_native` (`sandbox.py:1075`) is currently unreachable — `download_files` always routes to `_download_files_shell`.
 - **`labels` are creation-time only** and silently ignored on reconnect. They land on the `SandboxClaim` object; `pod_labels`/`pod_annotations` land on the Pod via `spec.additionalPodMetadata`. The SDK also always stamps `agents.x-k8s.io/created-by: python-client`, so a claim's label set is never exactly what was passed.
-- **`shutdown_after_seconds`, `pod_labels`, `pod_annotations` and `volume_claim_templates` are creation-time only**, and forwarded to `create_sandbox()` only when not `None`. That is for call-site readability and to keep the `assert "x" not in call_kwargs` tests meaningful — *not* for old-SDK compatibility, since the floor is now `>=0.5.4`.
-- **Creation-time parameters are inert in handle mode.** `create_kubernetes_sandbox` always returns a handle-mode backend, so `_ensure_sandbox`'s create branch never runs and anything creation-related arriving via `**kwargs` is stored and silently ignored. This is why the factory declares `warmpool_name`, `labels`, `pod_labels`, `pod_annotations`, `volume_claim_templates` and `shutdown_after_seconds` explicitly and routes them to `create_sandbox_claim` itself. Add a new creation-time constructor argument and you must decide whether the factory needs a matching explicit parameter.
+- **`shutdown_after_seconds`, `pod_labels`, `pod_annotations`, `volume_claim_templates` and `env` are creation-time only**, and forwarded to `create_sandbox()` only when not `None`. That is for call-site readability and to keep the `assert "x" not in call_kwargs` tests meaningful — *not* for old-SDK compatibility, since the floor is now `>=1.0.4`. Setting `env` also forces a cold start: the controller will not adopt a pre-warmed pod. The template must set `envVarsInjectionPolicy: Allowed`; the CRD default `Disallowed` rejects the claim with `EnvVarsInjectionRejected`.
+- **Creation-time parameters are inert in handle mode.** `create_kubernetes_sandbox` always returns a handle-mode backend, so `_ensure_sandbox`'s create branch never runs and anything creation-related arriving via `**kwargs` is stored and silently ignored. This is why the factory declares `warmpool_name`, `labels`, `pod_labels`, `pod_annotations`, `volume_claim_templates`, `shutdown_after_seconds` and `env` explicitly and routes them to `create_sandbox_claim` itself. Add a new creation-time constructor argument and you must decide whether the factory needs a matching explicit parameter.
+- **`enable_capture_offload` resolves the capture path.** `FilesystemMiddleware` writes large `execute` output to `/large_tool_results/<id>` and later `read_file`s that pointer. With `virtual_mode` on, the read is resolved under `root_dir`, so `execute_with_offload` resolves the capture path first. The override must stay: the base `aexecute_with_offload` calls `aexecute` directly and would write the unresolved path. `allow_prefixes` does not cover the capture file.
+- **`SandboxdBackend` is the native sandboxd backend, and it must stay a `BaseSandbox`.** `KubernetesSandbox` file tools still ship `python3 -c` scripts, so they fail on the stock `sandboxd:latest-main` image. `SandboxdBackend` keeps claim lifecycle, `env`, labels, reconnect, `allow_prefixes`, `virtual_mode` and capture offload, and implements `read`/`write`/`edit`/`ls`/`grep`/`glob`/`delete`/`upload_files`/`download_files` through `handle.files` (REST `/v1/files`). `execute` stays gRPC via `commands.run`, which needs the `k8s-agent-sandbox[grpc]` extra (`pip install 'langchain-k8s[sandboxd]'`). `FilesystemMiddleware._resolve_capture` only offloads when `isinstance(backend, BaseSandbox)`; dropping that base class silently disables capture offload. `scripts/kind-setup.sh` applies `k8s/sandboxd-template.yaml` and `k8s/sandboxd-warmpool.yaml`. `tests/integration/test_sandboxd_kind.py` skips when that pool is absent.
+- **`SandboxdBackend` confines file tools to `/workspace` and reroots capture files.** `sandboxd_root` defaults to `/workspace` (the daemon's `--root-dir`). `_to_rest_path` resolves virtual mode, checks `allow_prefixes` on mutating operations against the resolved path, then requires the path to sit under that root and strips it for the REST call (`/workspace/src/a.py` → `src/a.py`). Anything else is a structured `invalid_path`, not an exception. `FilesystemMiddleware` writes oversized `execute` output to `/large_tool_results/<id>`, which is outside `/workspace`. `execute_with_offload` and `_to_rest_path` both reroot that prefix to `<sandboxd_root>/large_tool_results/`, and that capture path is exempt from `allow_prefixes`. With `virtual_mode` on, `root_dir` should sit under `sandboxd_root` so the resolve step and the reroot agree. `grep` and `glob` are a REST walk (one `list` per directory, and `grep` reads each file); `**` still does not match dot-directories, but the walk descends into them so a basename pattern such as `*.py` can.
 - **`router_namespace` is validated by the SDK, at `start()`.** It feeds a pydantic `field_validator` on `SandboxLocalTunnelConnectionConfig` inside `_create_client`, so a malformed namespace raises `ValidationError` on first use rather than `ValueError` at construction. That is a consequence of invariant 1, not an oversight.
 - **`create_sandbox_claim` kept its positional arity across the 0.4.6 → 0.5.4 bump while parameter 2 changed meaning** from template name to warm pool name. A stale positional call therefore raises nothing — it writes a dangling `warmPoolRef` and fails at the controller after the full ready timeout. This is why `tests/conftest.py` autospecs `SandboxClient` and `K8sHelper`, and why the `create_sandbox_claim` assertion also checks `call_args.args[1]` explicitly.
+- **`from k8s_agent_sandbox import SandboxClient` stays a package import.** 1.0.4 added `py.typed` without an `__all__`, so pyright reports `reportPrivateImportUsage` on that re-export. The import is ignored rather than retargeted at `k8s_agent_sandbox.sandbox_client`, because the unit tests patch `k8s_agent_sandbox.SandboxClient`.
 
 ## Quick Reference (Makefile)
 
@@ -289,7 +296,7 @@ Script knobs, all with defaults:
 | Variable                 | Default         | Effect                                  |
 | ------------------------ | --------------- | --------------------------------------- |
 | `CLUSTER_NAME`           | `langchain-k8s` | Kind cluster name                       |
-| `AGENT_SANDBOX_VERSION`  | `v0.5.4`        | Controller / CRD release to install (needs >=v0.5.2) |
+| `AGENT_SANDBOX_VERSION`  | `v1.0.4`        | Controller / CRD release to install (needs >=v1.0.0; v1alpha1 `storedVersions` must be migrated on v0.5.x first) |
 | `REUSE_CLUSTER=1`        | unset           | Reuse an existing cluster instead of recreating |
 | `SKIP_CLUSTER=1`         | unset           | Skip cluster creation entirely          |
 

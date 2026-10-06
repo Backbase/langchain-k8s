@@ -46,7 +46,7 @@ uv add langchain-k8s
 
 ### Prerequisites
 
-- A Kubernetes cluster with the [agent-sandbox controller](https://github.com/kubernetes-sigs/agent-sandbox) **v0.5.2 or newer** installed
+- A Kubernetes cluster with the [agent-sandbox controller](https://github.com/kubernetes-sigs/agent-sandbox) **v1.0.0 or newer** installed
 - A `SandboxTemplate` resource defining the pod spec for your sandboxes
 - A `SandboxWarmPool` resource referencing that template — this is what sandboxes are claimed from, and it is mandatory (use `replicas: 0` for pure on-demand cold start)
 - `kubectl` configured with cluster access
@@ -69,6 +69,22 @@ There is no deprecated alias: passing `template_name=` now raises
 template and pass its name. `SandboxInClusterConnectionConfig(use_pod_ip=...)`
 is also gone; the pod IP is now preferred automatically with a cluster-DNS
 fallback.
+
+### Upgrading to 0.7.0
+
+The dependency floor is now `deepagents>=0.7.21` and `k8s-agent-sandbox>=1.0.4`,
+and the cluster needs an agent-sandbox controller **v1.0.0 or newer**. v1.0.0
+removed the `v1alpha1` API. A cluster that still lists `v1alpha1` in any
+agent-sandbox CRD's `status.storedVersions` cannot jump straight to v1.0 —
+upgrade to v0.5.x and finish the storage migration first. See the
+[v1alpha1 to v1beta1 migration guide](https://agent-sandbox.sigs.k8s.io/docs/getting_started/api-migration-guide/).
+
+Two behaviour changes come from deepagents 0.7:
+
+- `write()` overwrites a file that already exists (and creates missing parent
+  directories). Previously a second write to the same path failed.
+- `delete()` is part of the backend contract. `allow_prefixes` covers it the
+  same way it covers `write()` and `edit()`, including on the async path.
 
 ## Quick start
 
@@ -214,6 +230,34 @@ backend = KubernetesSandbox(
 )
 ```
 
+### sandboxd
+
+`SandboxdBackend` is the backend for a sandboxd pod. `execute` still runs over gRPC (`commands.run` on port 9090). `read`, `write`, `edit`, `ls`, `grep`, `glob`, `delete`, `upload_files` and `download_files` use sandboxd's REST filesystem API (`/v1/files` on port 8080), so they do not need `python3` inside the container. The stock `sandboxd:latest-main` image is enough.
+
+```bash
+pip install 'langchain-k8s[sandboxd]'
+```
+
+```python
+from langchain_k8s import SandboxdBackend
+
+backend = SandboxdBackend(
+    warmpool_name="sandboxd-pool",
+    namespace="agent-sandbox-system",
+)
+backend.write("/workspace/src/a.py", "print('hi')\n")
+```
+
+The constructor defaults `connection_config` to `SandboxdPodTunnelConnectionConfig`. `api_url` and `gateway_name` are rejected: the sandbox router cannot proxy gRPC. To attach a handle that a sandboxd client already created, pass `sandbox=handle`. `create_kubernetes_sandbox` still returns a `KubernetesSandbox`.
+
+Agent paths are real absolute paths, and every file tool confines them to `sandboxd_root` (default `/workspace`, the daemon's `--root-dir`). A path outside that root comes back as `invalid_path`. With `virtual_mode` on, set `root_dir` under `/workspace`.
+
+`FilesystemMiddleware` records oversized `execute` output at `/large_tool_results/<id>` and later `read_file`s that pointer. Both the shell write and the later read are rerooted to `/workspace/large_tool_results/<id>`, so the pointer opens. Set `enable_capture_offload=True` for that path; `SandboxdBackend` stays a `BaseSandbox`, which is what the middleware checks before it offloads.
+
+`grep` and `glob` walk the tree over REST: one `list` per directory, and `grep` reads each candidate file. That is one HTTP call per directory (and per file, for `grep`), not a single in-pod `python3` scan. Files larger than `grep_max_file_bytes` (default 1 MiB) and files that are not UTF-8 are skipped.
+
+`scripts/kind-setup.sh` applies `k8s/sandboxd-template.yaml` and `k8s/sandboxd-warmpool.yaml`. `tests/integration/test_sandboxd_kind.py` covers the native file tools and skips when the pool is absent.
+
 ## Sandbox lifecycle
 
 ### Thread-scoped (production)
@@ -299,13 +343,21 @@ backend = KubernetesSandbox(
 
 It has no effect on `start()`/`stop()`, and it does not create a pod per invocation. Auto-reconnect is also inactive in handle mode, where the caller owns the lifecycle.
 
+### Large command output
+
+`enable_capture_offload=True` makes oversized `execute` output stay in the sandbox. The tool result then carries a short preview and a `read_file` pointer under `/large_tool_results/<tool_call_id>`, instead of the full output. The default is off, so output is returned inline and clipped at `max_output_size`.
+
+Keep `max_output_size` above the middleware's inline budget (it derives that budget from `tool_token_limit_before_evict`, 20,000 tokens by default). If the preview itself is truncated, the offload result cannot be parsed and the agent sees the raw wrapper output.
+
+The capture file is written by `execute`, so `allow_prefixes` does not cover it. `/large_tool_results` — or `<root_dir>/large_tool_results` when `virtual_mode` is on — must be writable in the container, the same way `/workspace` must be.
+
 ---
 
 ## Enterprise features
 
 ### Path access policy
 
-Restrict which directories agents can write to using `allow_prefixes`. When set, only `write()` and `edit()` operations targeting paths under the specified prefixes are permitted. All other paths return an error without executing a command.
+Restrict which directories agents can write to using `allow_prefixes`. When set, only `write()`, `edit()` and `delete()` operations targeting paths under the specified prefixes are permitted. All other paths return an error without executing a command. The same check runs for the async variants (`awrite`, `aedit`, `adelete`).
 
 ```python
 backend = KubernetesSandbox(
@@ -317,11 +369,11 @@ backend = KubernetesSandbox(
 
 When `allow_prefixes` is `None` (the default), no write restrictions are applied.
 
-> **Note:** `allow_prefixes` is a tool-level policy — it controls which paths `write()` and `edit()` accept, but does not block shell commands like `execute("echo bad > /etc/passwd")`. Use the Kubernetes pod `securityContext` (e.g. `readOnlyRootFilesystem`) for system-level protection. The allowed directories must also be **writable inside the container** — see [Container permissions vs. sandbox policy](#container-permissions-vs-sandbox-policy).
+> **Note:** `allow_prefixes` is a tool-level policy — it controls which paths `write()`, `edit()` and `delete()` accept, but does not block shell commands like `execute("echo bad > /etc/passwd")` or `execute("rm -rf /")`. Use the Kubernetes pod `securityContext` (e.g. `readOnlyRootFilesystem`) for system-level protection. The allowed directories must also be **writable inside the container** — see [Container permissions vs. sandbox policy](#container-permissions-vs-sandbox-policy).
 
 ### Virtual filesystem
 
-When `virtual_mode=True`, all file-operation paths (`read`, `write`, `edit`, `ls`, `grep`, `glob`, uploads, downloads) are resolved under `root_dir` (default `/tmp`). Path traversal (`..`, `~`) is rejected.
+When `virtual_mode=True`, all file-operation paths (`read`, `write`, `edit`, `delete`, `ls`, `grep`, `glob`, uploads, downloads, and their async counterparts) are resolved under `root_dir` (default `/tmp`). Path traversal (`..`, `~`) is rejected. `glob()` and `grep()` with no path search `root_dir` rather than the filesystem root.
 
 ```python
 backend = KubernetesSandbox(
@@ -388,7 +440,7 @@ spec:
     spec:
       containers:
         - name: python-runtime
-          image: registry.k8s.io/agent-sandbox/python-runtime-sandbox:v0.5.4
+          image: registry.k8s.io/agent-sandbox/python-runtime-sandbox:v1.0.4
           volumeMounts:
             - name: workspace
               mountPath: /workspace
@@ -452,6 +504,20 @@ claim quickly with an `InvalidMetadata` reason rather than timing out.
 > **Note:** the SDK always stamps `agents.x-k8s.io/created-by: python-client`
 > on claims it creates, so a claim's label set is never exactly what you
 > passed in. Account for it in any label selector you write.
+
+### Environment variables
+
+`env` injects variables into the sandbox container through `spec.env`:
+
+```python
+backend = KubernetesSandbox(
+    warmpool_name="python-sandbox-pool",
+    namespace="agent-sandbox-system",
+    env={"LANG": "C.UTF-8"},
+)
+```
+
+Setting `env` forces a cold start from the warm-pool template. A pre-warmed pod is not adopted, so start-up is slower. The `SandboxTemplate` must set `envVarsInjectionPolicy: Allowed` (the CRD default is `Disallowed`); otherwise the claim fails immediately with `EnvVarsInjectionRejected`. An invalid variable name fails the same way rather than waiting out the ready timeout. `env` is creation-time only, and `create_kubernetes_sandbox` takes it as its own argument — passing it through `**kwargs` would be stored and ignored.
 
 ### Horizontal scaling and sticky sessions
 
@@ -582,7 +648,8 @@ Labels are only applied at creation time. When reconnecting via `claim_name`, th
 | `reuse_sandbox`          | `bool`                            | `True`      | Auto-reconnect and retry once when `execute()` hits a connection error (config-based only). Does not affect pod lifetime               |
 | `max_output_size`        | `int`                             | `1048576`   | Max output bytes before truncation                                                                                                     |
 | `command_timeout`        | `int`                             | `300`       | Default command timeout in seconds. Can be overridden per-call via `execute(timeout=...)`                                              |
-| `allow_prefixes`         | `list[str] \| None`               | `None`      | Restrict `write`/`edit` to these path prefixes                                                                                         |
+| `enable_capture_offload` | `bool`                            | `False`     | Leave large `execute` output in the sandbox and return a preview plus a `read_file` pointer                                            |
+| `allow_prefixes`         | `list[str] \| None`               | `None`      | Restrict `write`/`edit`/`delete` to these path prefixes                                                                                |
 | `root_dir`               | `str \| None`                     | `None`      | Root directory for virtual filesystem mode. Defaults to `/tmp` when `virtual_mode=True`                                                |
 | `virtual_mode`           | `bool`                            | `False`     | Resolve all paths under `root_dir`                                                                                                     |
 | `skip_cleanup`           | `bool`                            | `False`     | Preserve `SandboxClaim` on `stop()` (config-based only)                                                                                |
@@ -593,6 +660,7 @@ Labels are only applied at creation time. When reconnecting via `claim_name`, th
 | `pod_labels`             | `dict[str, str] \| None`          | `None`      | Labels stamped onto the sandbox **Pod** via `spec.additionalPodMetadata` (config-based only)                                           |
 | `pod_annotations`        | `dict[str, str] \| None`          | `None`      | Annotations stamped onto the sandbox **Pod** via `spec.additionalPodMetadata` (config-based only)                                      |
 | `volume_claim_templates` | `list[dict] \| None`              | `None`      | PVC templates for durable sandbox storage (config-based only)                                                                          |
+| `env`                    | `dict[str, str] \| None`          | `None`      | Container env vars via `spec.env`. Forces a cold start (config-based only)                                                             |
 | `router_namespace`       | `str`                             | `"agent-sandbox-system"` | Namespace of `sandbox-router-svc` for automatic port-forward (development mode only)                                      |
 
 </details>
@@ -611,6 +679,7 @@ Labels are only applied at creation time. When reconnecting via `claim_name`, th
 | `pod_annotations`        | `dict[str, str] \| None` | `None`       | Annotations stamped onto the sandbox **Pod**                             |
 | `volume_claim_templates` | `list[dict] \| None`     | `None`       | PVC templates for durable sandbox storage                                |
 | `shutdown_after_seconds` | `int \| None`            | `None`       | TTL after which the controller deletes the `SandboxClaim`                |
+| `env`                    | `dict[str, str] \| None` | `None`       | Container env vars via `spec.env`. Forces a cold start; ignored on reconnect |
 | `sandbox_ready_timeout`  | `int`                    | `180`        | Max seconds to wait for a newly created sandbox to become ready          |
 | `**kwargs`               |                          |              | Forwarded to `KubernetesSandbox` (e.g. `allow_prefixes`, `virtual_mode`) |
 
@@ -659,16 +728,19 @@ uv run pytest tests/integration/ -v -m integration
 The setup script will:
 
 1. Create a Kind cluster named `langchain-k8s`
-2. Install the agent-sandbox controller and extension CRDs from the all-in-one release asset (v0.5.4, overridable via `AGENT_SANDBOX_VERSION`)
+2. Install the agent-sandbox controller and extension CRDs from the all-in-one release asset (v1.0.4, overridable via `AGENT_SANDBOX_VERSION`)
 3. Deploy the sandbox router
 4. Apply the `python-sandbox-template` SandboxTemplate
 5. Apply the `python-sandbox-pool` SandboxWarmPool (`replicas: 0` by default; set `WARMPOOL_REPLICAS` to pre-warm pods instead)
+6. Apply the `sandboxd-template` SandboxTemplate and `sandboxd-pool` SandboxWarmPool
 
 ```
 k8s/
 ├── sandbox-router.yaml            # Router Deployment + Service
 ├── sandbox-template.yaml          # SandboxTemplate for Python runtime
-└── sandbox-warmpool.yaml          # SandboxWarmPool claims reference
+├── sandbox-warmpool.yaml          # SandboxWarmPool claims reference
+├── sandboxd-template.yaml         # SandboxTemplate for the sandboxd runtime
+└── sandboxd-warmpool.yaml         # SandboxWarmPool for sandboxd
 ```
 
 ---

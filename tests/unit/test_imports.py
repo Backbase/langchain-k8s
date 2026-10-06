@@ -13,6 +13,23 @@ def test_import_kubernetes_sandbox() -> None:
     assert KubernetesSandbox is not None
 
 
+def test_import_sandboxd_backend() -> None:
+    from langchain_k8s import SandboxdBackend
+
+    assert SandboxdBackend is not None
+
+
+def test_public_api() -> None:
+    import langchain_k8s
+
+    assert langchain_k8s.__all__ == [
+        "KubernetesSandbox",
+        "SandboxdBackend",
+        "create_kubernetes_sandbox",
+        "__version__",
+    ]
+
+
 def test_import_version() -> None:
     from langchain_k8s import __version__
 

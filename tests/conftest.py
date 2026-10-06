@@ -1,6 +1,6 @@
 """Shared test fixtures for langchain-k8s.
 
-Mock compatibility verified against k8s-agent-sandbox >=0.5.4, whose claim
+Mock compatibility verified against k8s-agent-sandbox >=1.0.4, whose claim
 path is ``k8s_helper.get_sandbox_claim`` → ``create_sandbox_claim(name,
 warmpool, namespace, ...)`` → ``wait_for_claim_ready``, and whose
 ``SandboxClient.create_sandbox`` takes ``warmpool`` as its first parameter.
@@ -37,12 +37,15 @@ of ``src/`` import paths — it does not apply to test scaffolding.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Literal
 from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 from k8s_agent_sandbox import SandboxClient
+from k8s_agent_sandbox.exceptions import SandboxRequestError
 from k8s_agent_sandbox.k8s_helper import K8sHelper
+from k8s_agent_sandbox.models import FileEntry
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 
 from langchain_k8s import KubernetesSandbox
@@ -64,6 +67,27 @@ class FakeExecutionResult:
     exit_code: int = 0
 
 
+def file_entry(
+    name: str,
+    *,
+    size: int = 1,
+    entry_type: Literal["file", "directory"] = "file",
+    modified: datetime | None = None,
+) -> FileEntry:
+    """Build a sandboxd ``FileEntry`` for filesystem mocks."""
+    return FileEntry(
+        name=name,
+        size=size,
+        type=entry_type,
+        modified=modified or datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def sandbox_request_error(status_code: int, message: str = "sandboxd request failed") -> SandboxRequestError:
+    """Build a ``SandboxRequestError`` carrying an HTTP status."""
+    return SandboxRequestError(message, status_code=status_code)
+
+
 def make_mock_client(
     *,
     claim_name: str = "test-claim-abc",
@@ -81,6 +105,7 @@ def make_mock_client(
     sandbox_handle.files.write = MagicMock(return_value=None)
     sandbox_handle.files.list = MagicMock(return_value=[])
     sandbox_handle.files.exists = MagicMock(return_value=True)
+    sandbox_handle.files.delete = MagicMock(return_value=None)
     sandbox_handle.terminate = MagicMock()
     sandbox_handle.close_connection = MagicMock()
 

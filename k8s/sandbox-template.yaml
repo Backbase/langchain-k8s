@@ -18,6 +18,9 @@ metadata:
   name: python-sandbox-template
   namespace: agent-sandbox-system
 spec:
+  # The CRD defaults this to Disallowed, which rejects SandboxClaim spec.env
+  # with EnvVarsInjectionRejected. The integration tests inject LANGCHAIN_K8S_IT.
+  envVarsInjectionPolicy: Allowed
   # Generate a headless Service per sandbox. Required, not optional: the
   # Python sandbox-router prefers the pod IP from the Sandbox status but falls
   # back to the DNS name `<sandbox>.<namespace>.svc.cluster.local`, and without
@@ -40,7 +43,7 @@ spec:
       # runtimeClassName: gvisor
       containers:
         - name: python-runtime
-          image: registry.k8s.io/agent-sandbox/python-runtime-sandbox:v0.5.4
+          image: registry.k8s.io/agent-sandbox/python-runtime-sandbox:v1.0.4
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8888
