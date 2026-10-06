@@ -2426,19 +2426,23 @@ class TestSandboxdBackend:
             mocked.assert_not_called()
             assert sb._started is False
 
-    def test_rejects_router_connection_modes(self) -> None:
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"api_url": "http://router"}, "api_url"),
+            ({"gateway_name": "gw"}, "gateway_name"),
+        ],
+    )
+    def test_rejects_router_connection_modes(self, kwargs: dict[str, str], match: str) -> None:
+        with pytest.raises(ValueError, match=match):
+            SandboxdBackend(warmpool_name="p", namespace="n", **kwargs)
+
+    def test_rejects_non_sandboxd_connection_config(self) -> None:
         from k8s_agent_sandbox.models import SandboxLocalTunnelConnectionConfig
 
-        with pytest.raises(ValueError, match="api_url"):
-            SandboxdBackend(warmpool_name="p", namespace="n", api_url="http://router")
-        with pytest.raises(ValueError, match="gateway_name"):
-            SandboxdBackend(warmpool_name="p", namespace="n", gateway_name="gw")
+        config = SandboxLocalTunnelConnectionConfig()
         with pytest.raises(ValueError, match="SandboxdPodTunnelConnectionConfig"):
-            SandboxdBackend(
-                warmpool_name="p",
-                namespace="n",
-                connection_config=SandboxLocalTunnelConnectionConfig(),
-            )
+            SandboxdBackend(warmpool_name="p", namespace="n", connection_config=config)
 
     def test_rejects_non_sandboxd_handle(self) -> None:
         handle = MagicMock()

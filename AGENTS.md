@@ -31,7 +31,6 @@ When working in this repository, read the OpenWiki quickstart first, then follow
 - `create_kubernetes_sandbox` — module-level get-or-create factory keyed on `claim_name`; the production entry point for thread-scoped sandboxes
 - **Handle mode** (`sandbox=` passed) vs **config-based mode** (`warmpool_name=` passed) — decides who owns the Kubernetes resource lifecycle
 - **Connection modes** — production (Gateway API), development (auto port-forward), advanced (direct `api_url`), in-cluster
-- `proxy.py` — monkey-patches a bug in the kubernetes Python client's NO_PROXY handling
 
 Public API is exactly `__all__ = ["KubernetesSandbox", "SandboxdBackend", "create_kubernetes_sandbox", "__version__"]`.
 
@@ -41,7 +40,6 @@ Public API is exactly `__all__ = ["KubernetesSandbox", "SandboxdBackend", "creat
 src/langchain_k8s/
   __init__.py        # Public API: KubernetesSandbox, SandboxdBackend, create_kubernetes_sandbox, __version__
   sandbox.py         # KubernetesSandbox, SandboxdBackend, create_kubernetes_sandbox — all the logic
-  proxy.py           # k8s client NO_PROXY monkey-patch (quarantined infrastructure)
   _version.py        # Version constant — the single source of truth for the package version
 
 tests/
@@ -237,7 +235,7 @@ Ruff is configured with rules: E, F, I, UP, B, SIM. Line length is 120 character
 
 ## Adding New Features
 
-1. Implement in `sandbox.py`; keep `proxy.py` isolated (it is infrastructure-only)
+1. Implement in `sandbox.py`
 2. Export new public symbols from `__init__.py` and add to `__all__`
 3. Add unit tests in `tests/unit/test_sandbox.py` using the existing mock client fixtures
 4. Add integration tests under `tests/integration/` if cluster interaction is involved — `test_kind.py` for the backend itself, `test_agent_kind.py` and `test_deepagent_kind.py` for agent-loop coverage. Do **not** decorate individual tests: each file sets `pytestmark = pytest.mark.integration` at module scope, and `tests/integration/conftest.py` auto-skips the whole directory when the Kind cluster is absent, so marker selection and skipping work per-directory regardless of how tests are split across files
@@ -280,7 +278,6 @@ When investigating a bug or adding a feature, start here:
 | `src/langchain_k8s/sandbox.py` | Core logic — lifecycle, execution, file ops           |
 | `tests/unit/test_sandbox.py`   | Existing unit test patterns and mock usage            |
 | `tests/conftest.py`            | Shared fixtures, mock `SandboxClient` factory. Note it also mocks `client.k8s_helper`, because `create_kubernetes_sandbox` reaches through it |
-| `src/langchain_k8s/proxy.py`   | Only touch if investigating proxy/k8s client issues   |
 | `specs/plans/foundation.md`    | Original architectural decisions and design rationale. **Historical** — the v0.1 plan, much of it superseded. Read it for *why*, never for *what* |
 
 ## Environment Variables (Integration Tests)
@@ -318,6 +315,6 @@ CI does not invoke `make` — it duplicates the raw commands. Keep the Makefile 
 - Do not add cluster-dependent code to unit tests — mock the `SandboxClient`
 - Do not skip `pyright` — fix type errors properly
 - Do not contact the Kubernetes API in `__init__` — initialization must remain lazy
-- Do not modify `proxy.py` unless fixing the specific NO_PROXY bug it addresses
+- Do not lower the `kubernetes>=36.0.3` floor: 34.1.0–35.0.0 drop `NO_PROXY` ([kubernetes-client/python#2460](https://github.com/kubernetes-client/python/issues/2460)), which `tests/unit/test_k8s_no_proxy.py` guards
 - Do not break the idempotency of `_resolve_virtual_path` — see [Invariants and Gotchas](#invariants-and-gotchas)
 - Do not treat `README.md`, `openwiki/`, or `specs/plans/` as authoritative on mechanism — verify against `src/`

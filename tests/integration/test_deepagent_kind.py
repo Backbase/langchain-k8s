@@ -345,6 +345,7 @@ class TestCreateDeepAgent:
         """Parallel deep agents with independent backends get isolated pods."""
         errors: list[Exception] = []
         sandbox_ids: dict[int, str] = {}
+        tool_outputs: dict[int, list[str]] = {}
 
         def deep_agent_worker(idx: int) -> None:
             try:
@@ -372,9 +373,7 @@ class TestCreateDeepAgent:
                     agent = create_deep_agent(model=model, backend=backend)
                     result = agent.invoke({"messages": [HumanMessage(content=f"Task {idx}")]})
                     sandbox_ids[idx] = backend.id
-
-                    tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
-                    assert any(f"deep-iso-{idx}" in m.content for m in tool_msgs)
+                    tool_outputs[idx] = [m.content for m in result["messages"] if isinstance(m, ToolMessage)]
             except Exception as e:
                 errors.append(e)
 
@@ -385,6 +384,8 @@ class TestCreateDeepAgent:
             t.join()
 
         assert not errors, f"Deep agent errors: {errors}"
+        for idx, outputs in tool_outputs.items():
+            assert any(f"deep-iso-{idx}" in content for content in outputs)
         assert len(sandbox_ids) == 3
         unique_ids = set(sandbox_ids.values())
         assert len(unique_ids) == 3, f"Expected 3 unique ids, got {len(unique_ids)}: {sandbox_ids}"
@@ -846,6 +847,7 @@ class TestDeepAgentThreadScoped:
         num_threads = 3
         errors: list[Exception] = []
         sandbox_ids: dict[int, str] = {}
+        tool_outputs: dict[int, list[str]] = {}
         claims = [f"thread-parallel-{i}" for i in range(num_threads)]
 
         def thread_worker(idx: int) -> None:
@@ -876,9 +878,7 @@ class TestDeepAgentThreadScoped:
                 agent = create_deep_agent(model=model, backend=backend)
                 result = agent.invoke({"messages": [HumanMessage(content=f"Task {idx}")]})
                 sandbox_ids[idx] = backend.id
-
-                tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
-                assert any(f"thread-{idx}" in m.content for m in tool_msgs)
+                tool_outputs[idx] = [m.content for m in result["messages"] if isinstance(m, ToolMessage)]
             except Exception as e:
                 errors.append(e)
 
@@ -894,6 +894,8 @@ class TestDeepAgentThreadScoped:
                 client.delete_sandbox(claim, NAMESPACE)
 
         assert not errors, f"Thread errors: {errors}"
+        for idx, outputs in tool_outputs.items():
+            assert any(f"thread-{idx}" in content for content in outputs)
         assert len(sandbox_ids) == num_threads
         unique_ids = set(sandbox_ids.values())
         assert len(unique_ids) == num_threads, (
