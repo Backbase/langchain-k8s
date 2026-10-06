@@ -10,6 +10,7 @@ import posixpath
 import shlex
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -38,8 +39,6 @@ from deepagents.backends.utils import (
     slice_read_response,
 )
 
-from langchain_k8s.proxy import patch_k8s_proxy_config
-
 if TYPE_CHECKING:
     # The 1.0.x package ships py.typed but no ``__all__``, so pyright treats
     # this re-export as private. Importing from ``sandbox_client`` instead
@@ -47,10 +46,6 @@ if TYPE_CHECKING:
     from k8s_agent_sandbox import SandboxClient  # pyright: ignore[reportPrivateImportUsage]
     from k8s_agent_sandbox.models import SandboxConnectionConfig
     from k8s_agent_sandbox.sandbox import Sandbox
-
-# Apply the NO_PROXY monkey-patch once at import time so that all
-# kubernetes client instances created in this process honour NO_PROXY.
-patch_k8s_proxy_config()
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +56,52 @@ _DEFAULT_ROUTER_NAMESPACE = "agent-sandbox-system"
 _DEFAULT_SANDBOXD_ROOT = "/workspace"
 _DEFAULT_GREP_MAX_FILE_BYTES = 1_048_576
 _CAPTURE_PREFIX = "/large_tool_results"
+
+
+def _validate_init_args(
+    *,
+    sandbox: Sandbox | None,
+    warmpool_name: str | None,
+    claim_name: str | None,
+    connection_config: SandboxConnectionConfig | None,
+    api_url: str | None,
+    gateway_name: str | None,
+) -> None:
+    if sandbox is not None and claim_name is not None:
+        msg = "Cannot specify both 'sandbox' and 'claim_name'"
+        raise ValueError(msg)
+    if sandbox is None and warmpool_name is None and claim_name is None:
+        msg = "Either 'sandbox' or 'warmpool_name' must be provided"
+        raise ValueError(msg)
+    if connection_config is not None and (api_url is not None or gateway_name is not None):
+        msg = "Cannot specify 'connection_config' together with 'api_url' or 'gateway_name'"
+        raise ValueError(msg)
+
+
+def _normalise_prefixes(allow_prefixes: list[str] | None) -> tuple[str, ...] | None:
+    if allow_prefixes is None:
+        return None
+    return tuple(p if p.endswith("/") else p + "/" for p in allow_prefixes)
+
+
+def _connection_mode_label(sandbox: Sandbox | None, gateway_name: str | None, api_url: str | None) -> str:
+    if sandbox is not None:
+        return "handle"
+    if gateway_name:
+        return "gateway"
+    if api_url:
+        return "api_url"
+    return "tunnel"
+
+
+def _disconnect(sandbox: Sandbox, reason: str) -> None:
+    """Close the local connection, leaving the ``SandboxClaim`` in place."""
+    saved_claim = sandbox.claim_name
+    try:
+        sandbox.close_connection()
+    except Exception as exc:
+        logger.warning("Error during sandbox disconnect: %s", exc)
+    logger.info("Sandbox disconnected (%s, SandboxClaim %s preserved)", reason, saved_claim)
 
 
 class KubernetesSandbox(BaseSandbox):
@@ -167,7 +208,7 @@ class KubernetesSandbox(BaseSandbox):
     """
 
     def __init__(
-        self,
+        self,  # NOSONAR(python:S107) public keyword-only constructor; dropping parameters breaks callers
         *,
         sandbox: Sandbox | None = None,
         warmpool_name: str | None = None,
@@ -363,15 +404,14 @@ class KubernetesSandbox(BaseSandbox):
                 the SDK at ``start()`` rather than at construction, since
                 ``__init__`` never builds SDK objects.
         """
-        if sandbox is not None and claim_name is not None:
-            msg = "Cannot specify both 'sandbox' and 'claim_name'"
-            raise ValueError(msg)
-        if sandbox is None and warmpool_name is None and claim_name is None:
-            msg = "Either 'sandbox' or 'warmpool_name' must be provided"
-            raise ValueError(msg)
-        if connection_config is not None and (api_url is not None or gateway_name is not None):
-            msg = "Cannot specify 'connection_config' together with 'api_url' or 'gateway_name'"
-            raise ValueError(msg)
+        _validate_init_args(
+            sandbox=sandbox,
+            warmpool_name=warmpool_name,
+            claim_name=claim_name,
+            connection_config=connection_config,
+            api_url=api_url,
+            gateway_name=gateway_name,
+        )
 
         self._warmpool_name = warmpool_name
         self._namespace = namespace
@@ -395,18 +435,8 @@ class KubernetesSandbox(BaseSandbox):
         self._env = env
         self._router_namespace = router_namespace
         self._owns_lifecycle = sandbox is None
-
-        if allow_prefixes is not None:
-            self._allow_prefixes: tuple[str, ...] | None = tuple(
-                p if p.endswith("/") else p + "/" for p in allow_prefixes
-            )
-        else:
-            self._allow_prefixes = None
-
-        if virtual_mode:
-            self._root_dir: str | None = root_dir if root_dir is not None else _DEFAULT_ROOT_DIR
-        else:
-            self._root_dir = root_dir
+        self._allow_prefixes = _normalise_prefixes(allow_prefixes)
+        self._root_dir: str | None = _DEFAULT_ROOT_DIR if virtual_mode and root_dir is None else root_dir
 
         self._client: SandboxClient | None = None
         self._lock = threading.Lock()
@@ -428,7 +458,7 @@ class KubernetesSandbox(BaseSandbox):
             self._warmpool_name,
             self._namespace,
             self._reuse_sandbox,
-            "handle" if sandbox is not None else ("gateway" if gateway_name else ("api_url" if api_url else "tunnel")),
+            _connection_mode_label(sandbox, gateway_name, api_url),
             self._allow_prefixes,
             self._root_dir,
             self._virtual_mode,
@@ -1097,7 +1127,8 @@ class KubernetesSandbox(BaseSandbox):
             len(paths),
         )
         self._ensure_sandbox()
-        assert self._sandbox is not None
+        sandbox = self._sandbox
+        assert sandbox is not None
 
         results: list[FileDownloadResponse] = []
         for path in paths:
@@ -1112,8 +1143,7 @@ class KubernetesSandbox(BaseSandbox):
                 results.append(FileDownloadResponse(path=path, content=None, error=error))
                 continue
             try:
-                assert self._sandbox is not None
-                content = self._sandbox.files.read(resolved)
+                content = sandbox.files.read(resolved)
                 logger.debug(
                     "download_files: sandbox=%s path=%s size=%d OK (native)",
                     self.id,
@@ -1294,35 +1324,16 @@ class KubernetesSandbox(BaseSandbox):
             if not self._started:
                 return
 
-            if self._sandbox is not None and not self._owns_lifecycle:
-                # Handle mode: only close the local connection.
-                saved_claim = self._sandbox.claim_name
-                try:
-                    self._sandbox.close_connection()
-                except Exception as exc:
-                    logger.warning("Error during sandbox disconnect: %s", exc)
-                logger.info(
-                    "Sandbox disconnected (handle mode, SandboxClaim %s preserved)",
-                    saved_claim,
-                )
+            sandbox = self._sandbox
+            if sandbox is not None and not self._owns_lifecycle:
+                _disconnect(sandbox, "handle mode")
                 self._sandbox = None
-            elif self._sandbox is not None and self._client is not None:
+            elif sandbox is not None and self._client is not None:
                 if self._skip_cleanup:
-                    saved_claim = self._sandbox.claim_name
-                    try:
-                        self._sandbox.close_connection()
-                    except Exception as exc:
-                        logger.warning("Error during sandbox disconnect: %s", exc)
-                    logger.info(
-                        "Sandbox disconnected (skip_cleanup=True, SandboxClaim %s preserved)",
-                        saved_claim,
-                    )
+                    _disconnect(sandbox, "skip_cleanup=True")
                 else:
                     try:
-                        self._client.delete_sandbox(
-                            self._sandbox.claim_name,
-                            self._namespace,
-                        )
+                        self._client.delete_sandbox(sandbox.claim_name, self._namespace)
                     except Exception as exc:
                         logger.warning("Error during sandbox cleanup: %s", exc)
                     logger.info("Sandbox stopped")
@@ -1583,10 +1594,7 @@ class SandboxdBackend(KubernetesSandbox):
             entries = self._filesystem().list(mapped.relative, timeout=self._command_timeout)
         except Exception as exc:
             return LsResult(error=self._file_error_message(exc, path, op="ls"))
-        infos = [
-            self._file_info(entry.name if not mapped.relative else f"{mapped.relative}/{entry.name}", entry)
-            for entry in entries
-        ]
+        infos = [self._file_info(_join_relative(mapped.relative, entry.name), entry) for entry in entries]
         infos.sort(key=lambda info: info["path"])
         return LsResult(entries=infos)
 
@@ -1596,17 +1604,10 @@ class SandboxdBackend(KubernetesSandbox):
             matcher = compile_grep_include_glob(pattern)
         except InvalidGlobPatternError as exc:
             return GlobResult(error=str(exc))
-        start, error = self._search_root(path)
-        if error is not None or start is None:
+        files, error = self._walk_matching(path, matcher)
+        if error is not None:
             return GlobResult(error=error)
-        files, walk_error = self._collect_files(start.relative)
-        if walk_error is not None:
-            return GlobResult(error=walk_error)
-        matches: list[FileInfo] = []
-        for relative, entry in files:
-            search_rel = self._relative_to(relative, start.relative)
-            if matcher(search_rel):
-                matches.append(self._file_info(relative, entry))
+        matches = [self._file_info(relative, entry) for relative, entry in files]
         matches.sort(key=lambda info: info.get("modified_at", ""), reverse=True)
         return GlobResult(matches=matches)
 
@@ -1621,48 +1622,56 @@ class SandboxdBackend(KubernetesSandbox):
         """Search file text by walking sandboxd and reading each candidate over REST."""
         if max_count is not None and max_count < 0:
             return GrepResult(error="max_count must be greater than or equal to zero")
-        matcher = None
-        if glob is not None:
-            try:
-                matcher = compile_grep_include_glob(glob)
-            except InvalidGlobPatternError as exc:
-                return GrepResult(error=str(exc))
+        try:
+            matcher = compile_grep_include_glob(glob) if glob is not None else None
+        except InvalidGlobPatternError as exc:
+            return GrepResult(error=str(exc))
+        candidates, error = self._walk_matching(path, matcher)
+        if error is not None:
+            return GrepResult(error=error)
+        matches: list[GrepMatch] = []
+        for relative, entry in candidates:
+            text = self._read_grep_candidate(relative, entry)
+            if text is None:
+                continue
+            found = _grep_lines(text, pattern, self._absolute_from_relative(relative))
+            if max_count is not None and len(matches) + len(found) > max_count:
+                matches.extend(found[: max_count - len(matches)])
+                return GrepResult(matches=matches, truncated=True)
+            matches.extend(found)
+        return GrepResult(matches=matches, truncated=False)
+
+    def _walk_matching(
+        self, path: str | None, matcher: Callable[[str], bool] | None
+    ) -> tuple[list[tuple[str, Any]], str | None]:
+        """Walk the search root and keep files whose path relative to it satisfies *matcher*."""
         start, error = self._search_root(path)
         if error is not None or start is None:
-            return GrepResult(error=error)
+            return [], error
         files, walk_error = self._collect_files(start.relative)
         if walk_error is not None:
-            return GrepResult(error=walk_error)
-        matches: list[GrepMatch] = []
-        truncated = False
-        for relative, entry in files:
-            if truncated:
-                break
-            search_rel = self._relative_to(relative, start.relative)
-            if matcher is not None and not matcher(search_rel):
-                continue
-            if entry.size > self._grep_max_file_bytes:
-                logger.debug("grep: skipping oversized file path=%s size=%d", relative, entry.size)
-                continue
-            try:
-                payload = self._filesystem().read(relative, timeout=self._command_timeout)
-            except Exception as exc:
-                logger.debug("grep: skipping unreadable file path=%s reason=%s", relative, exc)
-                continue
-            try:
-                text = payload.decode("utf-8")
-            except UnicodeDecodeError:
-                logger.debug("grep: skipping non-utf8 file path=%s", relative)
-                continue
-            absolute = self._absolute_from_relative(relative)
-            for line_number, line in enumerate(text.splitlines(), start=1):
-                if pattern not in line:
-                    continue
-                if max_count is not None and len(matches) >= max_count:
-                    truncated = True
-                    break
-                matches.append(GrepMatch(path=absolute, line=line_number, text=line))
-        return GrepResult(matches=matches, truncated=truncated)
+            return [], walk_error
+        return [
+            (relative, entry)
+            for relative, entry in files
+            if matcher is None or matcher(self._relative_to(relative, start.relative))
+        ], None
+
+    def _read_grep_candidate(self, relative: str, entry: Any) -> str | None:
+        """Return the UTF-8 text of *relative*, or ``None`` if grep should skip it."""
+        if entry.size > self._grep_max_file_bytes:
+            logger.debug("grep: skipping oversized file path=%s size=%d", relative, entry.size)
+            return None
+        try:
+            payload = self._filesystem().read(relative, timeout=self._command_timeout)
+        except Exception as exc:
+            logger.debug("grep: skipping unreadable file path=%s reason=%s", relative, exc)
+            return None
+        try:
+            return payload.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.debug("grep: skipping non-utf8 file path=%s", relative)
+            return None
 
     def delete(self, file_path: str) -> DeleteResult:
         """Delete a path recursively through sandboxd's REST ``DELETE``."""
@@ -1822,7 +1831,7 @@ class SandboxdBackend(KubernetesSandbox):
             except Exception as exc:
                 return found, self._file_error_message(exc, self._absolute_from_relative(current), op="ls")
             for child in children:
-                child_rel = child.name if not current else f"{current}/{child.name}"
+                child_rel = _join_relative(current, child.name)
                 if child.type == "directory":
                     queue.append(child_rel)
                 elif child.type == "file":
@@ -2015,10 +2024,6 @@ def create_kubernetes_sandbox(
     before the exception propagates, so a retry starts from a clean slate.
     """
     from k8s_agent_sandbox.exceptions import SandboxNotFoundError as _SandboxNotFoundError
-    from k8s_agent_sandbox.pod_metadata import build_pod_metadata as _build_pod_metadata
-    from k8s_agent_sandbox.utils import (
-        construct_sandbox_claim_lifecycle_spec as _lifecycle_spec,
-    )
     from kubernetes import client as _k8s_client
 
     # Fast check: does the SandboxClaim resource exist?  A plain GET
@@ -2046,20 +2051,14 @@ def create_kubernetes_sandbox(
         # attaching to the existing claim.
         created_claim: Any = None
         try:
-            create_claim_kwargs: dict[str, Any] = {}
-            if labels is not None:
-                create_claim_kwargs["labels"] = labels
-            if volume_claim_templates is not None:
-                create_claim_kwargs["volume_claim_templates"] = volume_claim_templates
-            if shutdown_after_seconds is not None:
-                create_claim_kwargs["lifecycle"] = _lifecycle_spec(shutdown_after_seconds)
-            if env is not None:
-                create_claim_kwargs["env"] = env
-            # Reuse the SDK's own builder so both creation paths apply
-            # identical client-side label validation.
-            pod_metadata = _build_pod_metadata(pod_labels, pod_annotations)
-            if pod_metadata is not None:
-                create_claim_kwargs["pod_metadata"] = pod_metadata
+            create_claim_kwargs = _claim_create_kwargs(
+                labels=labels,
+                pod_labels=pod_labels,
+                pod_annotations=pod_annotations,
+                volume_claim_templates=volume_claim_templates,
+                shutdown_after_seconds=shutdown_after_seconds,
+                env=env,
+            )
             created_claim = client.k8s_helper.create_sandbox_claim(
                 claim_name,
                 warmpool_name,
@@ -2071,31 +2070,74 @@ def create_kubernetes_sandbox(
                 raise
 
         if created_claim is not None:
-            # A single watch on the claim: its status carries both the bound
-            # sandbox name and the forwarded Ready condition, so there is no
-            # need to watch the Sandbox resource separately.  Seeding the
-            # watch with the create response's resourceVersion lets the
-            # apiserver serve it from the watch cache.
-            resource_version = None
-            if isinstance(created_claim, dict):
-                resource_version = (created_claim.get("metadata") or {}).get("resourceVersion")
-            try:
-                client.k8s_helper.wait_for_claim_ready(
-                    claim_name,
-                    namespace,
-                    timeout=sandbox_ready_timeout,
-                    resource_version=resource_version,
-                )
-            except Exception:
-                logger.warning("SandboxClaim %s did not become ready — rolling it back", claim_name)
-                client.k8s_helper.delete_sandbox_claim(claim_name, namespace)
-                raise
+            _wait_for_claim_or_rollback(client, created_claim, claim_name, namespace, sandbox_ready_timeout)
 
         sandbox_handle = client.get_sandbox(
             claim_name=claim_name,
             namespace=namespace,
         )
     return KubernetesSandbox(sandbox=sandbox_handle, namespace=namespace, **kwargs)
+
+
+def _claim_create_kwargs(
+    *,
+    labels: dict[str, str] | None,
+    pod_labels: dict[str, str] | None,
+    pod_annotations: dict[str, str] | None,
+    volume_claim_templates: list[dict[str, Any]] | None,
+    shutdown_after_seconds: int | None,
+    env: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Build the optional ``create_sandbox_claim`` kwargs, omitting unset ones."""
+    from k8s_agent_sandbox.pod_metadata import build_pod_metadata as _build_pod_metadata
+    from k8s_agent_sandbox.utils import (
+        construct_sandbox_claim_lifecycle_spec as _lifecycle_spec,
+    )
+
+    kwargs: dict[str, Any] = {}
+    if labels is not None:
+        kwargs["labels"] = labels
+    if volume_claim_templates is not None:
+        kwargs["volume_claim_templates"] = volume_claim_templates
+    if shutdown_after_seconds is not None:
+        kwargs["lifecycle"] = _lifecycle_spec(shutdown_after_seconds)
+    if env is not None:
+        kwargs["env"] = env
+    # Reuse the SDK's own builder so both creation paths apply
+    # identical client-side label validation.
+    pod_metadata = _build_pod_metadata(pod_labels, pod_annotations)
+    if pod_metadata is not None:
+        kwargs["pod_metadata"] = pod_metadata
+    return kwargs
+
+
+def _wait_for_claim_or_rollback(
+    client: SandboxClient,
+    created_claim: Any,
+    claim_name: str,
+    namespace: str,
+    timeout: int,
+) -> None:
+    """Wait for a claim this call created to become ready, deleting it on failure."""
+    # A single watch on the claim: its status carries both the bound
+    # sandbox name and the forwarded Ready condition, so there is no
+    # need to watch the Sandbox resource separately.  Seeding the
+    # watch with the create response's resourceVersion lets the
+    # apiserver serve it from the watch cache.
+    resource_version = None
+    if isinstance(created_claim, dict):
+        resource_version = (created_claim.get("metadata") or {}).get("resourceVersion")
+    try:
+        client.k8s_helper.wait_for_claim_ready(
+            claim_name,
+            namespace,
+            timeout=timeout,
+            resource_version=resource_version,
+        )
+    except Exception:
+        logger.warning("SandboxClaim %s did not become ready — rolling it back", claim_name)
+        client.k8s_helper.delete_sandbox_claim(claim_name, namespace)
+        raise
 
 
 def _validate_path(path: str) -> FileOperationError | None:
@@ -2112,6 +2154,19 @@ def _validate_path(path: str) -> FileOperationError | None:
     if not path or not path.startswith("/"):
         return "invalid_path"
     return None
+
+
+def _join_relative(parent: str, name: str) -> str:
+    return f"{parent}/{name}" if parent else name
+
+
+def _grep_lines(text: str, pattern: str, path: str) -> list[GrepMatch]:
+    """Return every line of *text* containing the literal *pattern*."""
+    return [
+        GrepMatch(path=path, line=line_number, text=line)
+        for line_number, line in enumerate(text.splitlines(), start=1)
+        if pattern in line
+    ]
 
 
 def _classify_error(output: str) -> FileOperationError:

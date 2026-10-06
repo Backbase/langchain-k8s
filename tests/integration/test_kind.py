@@ -35,6 +35,7 @@ import uuid
 from collections.abc import Generator
 
 import pytest
+from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
 
 from langchain_k8s import KubernetesSandbox, create_kubernetes_sandbox
 
@@ -44,7 +45,7 @@ WARMPOOL = "python-sandbox-pool"
 NAMESPACE = "agent-sandbox-system"
 
 
-@pytest.fixture()
+@pytest.fixture
 def sandbox() -> Generator[KubernetesSandbox]:
     """Provide a sandbox connected to Kind via auto-tunnel."""
     sb = KubernetesSandbox(
@@ -212,14 +213,12 @@ class TestConcurrency:
             warmpool_name=WARMPOOL,
             namespace=NAMESPACE,
         ) as sb:
-            results: dict[int, str] = {}
+            results: dict[int, ExecuteResponse] = {}
             errors: list[Exception] = []
 
             def worker(idx: int) -> None:
                 try:
-                    resp = sb.execute(f"echo 'thread-{idx}'")
-                    assert resp.exit_code == 0
-                    results[idx] = resp.output
+                    results[idx] = sb.execute(f"echo 'thread-{idx}'")
                 except Exception as e:
                     errors.append(e)
 
@@ -232,7 +231,8 @@ class TestConcurrency:
             assert not errors, f"Thread errors: {errors}"
             assert len(results) == 5
             for i in range(5):
-                assert f"thread-{i}" in results[i]
+                assert results[i].exit_code == 0
+                assert f"thread-{i}" in results[i].output
 
     def test_concurrent_mixed_operations(self) -> None:
         """execute(), upload_files(), download_files() from parallel threads."""
@@ -244,27 +244,25 @@ class TestConcurrency:
             sb.execute("echo 'seed-data' > /tmp/concurrent-read.txt")
 
             errors: list[Exception] = []
+            exec_results: list[ExecuteResponse] = []
+            upload_results: list[FileUploadResponse] = []
+            download_results: list[FileDownloadResponse] = []
 
             def exec_worker() -> None:
                 try:
-                    resp = sb.execute("echo 'concurrent-exec'")
-                    assert resp.exit_code == 0
+                    exec_results.append(sb.execute("echo 'concurrent-exec'"))
                 except Exception as e:
                     errors.append(e)
 
             def upload_worker(idx: int) -> None:
                 try:
-                    results = sb.upload_files([(f"/tmp/concurrent-upload-{idx}.txt", b"upload-data")])
-                    assert results[0].error is None
+                    upload_results.extend(sb.upload_files([(f"/tmp/concurrent-upload-{idx}.txt", b"upload-data")]))
                 except Exception as e:
                     errors.append(e)
 
             def download_worker() -> None:
                 try:
-                    results = sb.download_files(["/tmp/concurrent-read.txt"])
-                    assert results[0].error is None
-                    assert results[0].content is not None
-                    assert b"seed-data" in results[0].content
+                    download_results.extend(sb.download_files(["/tmp/concurrent-read.txt"]))
                 except Exception as e:
                     errors.append(e)
 
@@ -282,6 +280,13 @@ class TestConcurrency:
                 t.join()
 
             assert not errors, f"Thread errors: {errors}"
+            assert [r.exit_code for r in exec_results] == [0, 0]
+            assert [r.error for r in upload_results] == [None, None]
+            assert len(download_results) == 2
+            for downloaded in download_results:
+                assert downloaded.error is None
+                assert downloaded.content is not None
+                assert b"seed-data" in downloaded.content
 
             # Verify uploads persisted
             resp = sb.execute("cat /tmp/concurrent-upload-0.txt /tmp/concurrent-upload-1.txt")
@@ -316,6 +321,7 @@ class TestConcurrency:
         num_instances = 3
         errors: list[Exception] = []
         sandbox_ids: dict[int, str] = {}
+        readbacks: dict[int, ExecuteResponse] = {}
 
         def instance_worker(idx: int) -> None:
             try:
@@ -324,13 +330,10 @@ class TestConcurrency:
                     namespace=NAMESPACE,
                 ) as sb:
                     # Each sandbox gets its own pod — write a unique marker
-                    marker = f"instance-{idx}-marker"
-                    sb.execute(f"echo '{marker}' > /tmp/instance-marker.txt")
+                    sb.execute(f"echo 'instance-{idx}-marker' > /tmp/instance-marker.txt")
 
                     # Read it back to confirm isolation
-                    resp = sb.execute("cat /tmp/instance-marker.txt")
-                    assert resp.exit_code == 0
-                    assert marker in resp.output
+                    readbacks[idx] = sb.execute("cat /tmp/instance-marker.txt")
 
                     # Record the sandbox id (claim name) to verify uniqueness
                     sandbox_ids[idx] = sb.id
@@ -344,6 +347,9 @@ class TestConcurrency:
             t.join()
 
         assert not errors, f"Instance errors: {errors}"
+        for idx, resp in readbacks.items():
+            assert resp.exit_code == 0
+            assert f"instance-{idx}-marker" in resp.output
         assert len(sandbox_ids) == num_instances
         # Each instance should have a distinct sandbox id (different pods)
         unique_ids = set(sandbox_ids.values())

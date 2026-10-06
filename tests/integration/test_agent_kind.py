@@ -24,7 +24,7 @@ import threading
 import pytest
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from langchain_k8s import KubernetesSandbox
 from tests.conftest import FakeToolModel
@@ -474,7 +474,7 @@ class TestDeepAgentLifecycle:
         )
 
         errors: list[Exception] = []
-        results: dict[int, str] = {}
+        results: dict[int, BaseMessage] = {}
 
         def agent_worker(idx: int) -> None:
             try:
@@ -499,9 +499,7 @@ class TestDeepAgentLifecycle:
                     middleware=[FilesystemMiddleware(backend=backend)],
                 )
                 result = agent.invoke({"messages": [HumanMessage(content=f"Agent {idx} task")]})
-                tool_msg = result["messages"][2]
-                assert isinstance(tool_msg, ToolMessage)
-                results[idx] = tool_msg.content
+                results[idx] = result["messages"][2]
             except Exception as e:
                 errors.append(e)
 
@@ -514,13 +512,15 @@ class TestDeepAgentLifecycle:
         assert not errors, f"Agent errors: {errors}"
         assert len(results) == 3
         for i in range(3):
-            assert f"agent-{i}" in results[i]
+            assert isinstance(results[i], ToolMessage)
+            assert f"agent-{i}" in results[i].content
         backend.stop()
 
     def test_independent_backends_parallel_agents(self) -> None:
         """Each agent gets its own backend — separate pods, isolated state."""
         errors: list[Exception] = []
         sandbox_ids: dict[int, str] = {}
+        read_msgs: dict[int, BaseMessage] = {}
 
         def agent_worker(idx: int) -> None:
             try:
@@ -566,11 +566,7 @@ class TestDeepAgentLifecycle:
                     )
                     result = agent.invoke({"messages": [HumanMessage(content=f"Isolated task {idx}")]})
                     sandbox_ids[idx] = backend.id
-
-                    # The read result should contain only this agent's marker
-                    read_msg = result["messages"][4]
-                    assert isinstance(read_msg, ToolMessage)
-                    assert f"isolated-{idx}" in read_msg.content
+                    read_msgs[idx] = result["messages"][4]
             except Exception as e:
                 errors.append(e)
 
@@ -581,6 +577,10 @@ class TestDeepAgentLifecycle:
             t.join()
 
         assert not errors, f"Agent errors: {errors}"
+        # The read result should contain only this agent's marker
+        for idx, read_msg in read_msgs.items():
+            assert isinstance(read_msg, ToolMessage)
+            assert f"isolated-{idx}" in read_msg.content
         assert len(sandbox_ids) == 3
         # All sandbox IDs should be unique (different pods)
         unique_ids = set(sandbox_ids.values())

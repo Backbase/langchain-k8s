@@ -139,13 +139,13 @@ def make_mock_client(
     return client
 
 
-@pytest.fixture()
+@pytest.fixture
 def mock_sandbox_client() -> MagicMock:
     """Provide a mock ``SandboxClient`` that is automatically patched."""
     return make_mock_client()
 
 
-@pytest.fixture()
+@pytest.fixture
 def sandbox(mock_sandbox_client: MagicMock) -> KubernetesSandbox:
     """Provide a ``KubernetesSandbox`` wired to a mock SDK client."""
     with patch(
@@ -162,7 +162,7 @@ def sandbox(mock_sandbox_client: MagicMock) -> KubernetesSandbox:
             sb.stop()
 
 
-@pytest.fixture()
+@pytest.fixture
 def started_sandbox(sandbox: KubernetesSandbox) -> KubernetesSandbox:
     """Provide a ``KubernetesSandbox`` that has already been started."""
     sandbox.start()
