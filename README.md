@@ -11,9 +11,9 @@
 <p align="center">
   <a href="https://pypi.org/project/langchain-k8s/"><img src="https://img.shields.io/pypi/v/langchain-k8s?style=flat-square&color=326CE5&label=PyPI" alt="PyPI version"></a>
   <a href="https://pypi.org/project/langchain-k8s/"><img src="https://img.shields.io/pypi/pyversions/langchain-k8s?style=flat-square&color=F59E0B" alt="Python versions"></a>
-  <a href="https://github.com/uesleilima/langchain-k8s/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/uesleilima/langchain-k8s/ci.yml?style=flat-square&label=CI" alt="CI status"></a>
-  <a href="https://sonarcloud.io/summary/new_code?id=uesleilima_langchain-k8s"><img src="https://sonarcloud.io/api/project_badges/measure?project=uesleilima_langchain-k8s&metric=alert_status" alt="Quality Gate Status"></a>
-  <a href="https://github.com/uesleilima/langchain-k8s/blob/main/LICENSE"><img src="https://img.shields.io/github/license/uesleilima/langchain-k8s?style=flat-square&color=22C55E" alt="License"></a>
+  <a href="https://github.com/Backbase/langchain-k8s/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Backbase/langchain-k8s/ci.yml?style=flat-square&label=CI" alt="CI status"></a>
+  <a href="https://sonarcloud.io/summary/new_code?id=backbase_langchain-k8s"><img src="https://sonarcloud.io/api/project_badges/measure?project=backbase_langchain-k8s&metric=alert_status" alt="Quality Gate Status"></a>
+  <a href="https://github.com/Backbase/langchain-k8s/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Backbase/langchain-k8s?style=flat-square&color=22C55E" alt="License"></a>
 </p>
 
 <p align="center">
@@ -696,7 +696,7 @@ ecosystem-standard mode, so creation-time constructor arguments arriving via
 
 ```bash
 # Clone and install
-git clone https://github.com/uesleilima/langchain-k8s.git
+git clone https://github.com/Backbase/langchain-k8s.git
 cd langchain-k8s
 uv sync
 

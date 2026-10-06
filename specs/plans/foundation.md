@@ -238,9 +238,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/uesleilima/langchain-k8s"
-Repository = "https://github.com/uesleilima/langchain-k8s"
-Issues = "https://github.com/uesleilima/langchain-k8s/issues"
+Homepage = "https://github.com/Backbase/langchain-k8s"
+Repository = "https://github.com/Backbase/langchain-k8s"
+Issues = "https://github.com/Backbase/langchain-k8s/issues"
 
 [build-system]
 requires = ["hatchling"]

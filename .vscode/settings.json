@@ -24,7 +24,7 @@
         "uv": true
     },
     "sonarlint.connectedMode.project": {
-        "connectionId": "uesleilima",
-        "projectKey": "uesleilima_langchain-k8s"
+        "connectionId": "backbase",
+        "projectKey": "backbase_langchain-k8s"
     }
 }

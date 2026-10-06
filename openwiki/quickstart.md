@@ -258,4 +258,4 @@ See [Integrations: Upgrading](integrations/upgrading.md).
 - **k8s-agent-sandbox SDK**: https://pypi.org/project/k8s-agent-sandbox/
 - **Kind (local Kubernetes)**: https://kind.sigs.k8s.io/
 - **This project on PyPI**: https://pypi.org/project/langchain-k8s/
-- **This project on GitHub**: https://github.com/uesleilima/langchain-k8s
+- **This project on GitHub**: https://github.com/Backbase/langchain-k8s
