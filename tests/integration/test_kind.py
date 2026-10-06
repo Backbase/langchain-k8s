@@ -13,6 +13,8 @@ This creates a Kind cluster named ``langchain-k8s`` with:
 3. ``python-sandbox-template`` SandboxTemplate
 4. ``python-sandbox-pool`` SandboxWarmPool — what claims actually
    reference; the pool is what points at the template
+5. ``sandboxd-template`` and ``sandboxd-pool`` — shell execute only;
+   the stock image has no ``python3``
 
 The ``python-runtime-sandbox`` image is *not* preloaded into Kind; the node
 pulls it from ``registry.k8s.io`` on first use, so the first test to create a

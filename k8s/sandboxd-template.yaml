@@ -1,11 +1,12 @@
 # SandboxTemplate running the sandboxd runtime (KEP-539.2).
 #
-# Commands execute in this container, so every tool the agent needs — including
-# python3, which BaseSandbox uses for read/write/edit/glob/grep — has to be in
-# the image. The staging tag latest-main does not include python3 (checked
-# against sha256:a6a7ffeb9a09). Shell execute works; the file tools do not.
-# kind-setup.sh does not apply this manifest. The image is an unpinned staging
-# build — pin a digest before using it anywhere but a local experiment.
+# Shell execute runs in this container over gRPC. SandboxdBackend file tools
+# use the REST API on port 8080, so they do not need python3 in the image.
+# KubernetesSandbox file tools still ship python3 -c scripts and fail here.
+# The staging tag latest-main does not include python3 (checked against
+# sha256:a6a7ffeb9a09). scripts/kind-setup.sh applies this manifest. The image
+# is an unpinned staging build — pin a digest before using it anywhere but a
+# local experiment.
 #
 # Reach it with SandboxdPodTunnelConnectionConfig, which port-forwards 8080
 # (REST) and 9090 (gRPC) straight to the pod. The sandbox-router cannot proxy

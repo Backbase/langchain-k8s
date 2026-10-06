@@ -3,17 +3,67 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 from deepagents.backends.protocol import ExecuteResponse
+from deepagents.backends.sandbox import BaseSandbox
 
-from langchain_k8s import KubernetesSandbox, create_kubernetes_sandbox
-from tests.conftest import FakeExecutionResult, make_mock_client
+from langchain_k8s import KubernetesSandbox, SandboxdBackend, create_kubernetes_sandbox
+from tests.conftest import FakeExecutionResult, file_entry, make_mock_client, sandbox_request_error
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _sandboxd(**overrides: object) -> Iterator[tuple[SandboxdBackend, MagicMock]]:
+    """Yield a ``SandboxdBackend`` whose client stays patched for the whole call."""
+    mock_client = make_mock_client()
+    defaults: dict[str, object] = {"warmpool_name": "sandboxd-pool", "namespace": "ns"}
+    defaults.update(overrides)
+    with patch("k8s_agent_sandbox.SandboxClient", return_value=mock_client):
+        sb = SandboxdBackend(**defaults)  # type: ignore[arg-type]
+        try:
+            yield sb, mock_client._mock_sandbox_handle
+        finally:
+            if sb._started:
+                sb.stop()
+
+
+def _sample_tree(path: str, timeout: float = 60) -> list[object]:
+    """A small tree used by the glob and grep tests."""
+    del timeout
+    tree: dict[str, list[object]] = {
+        "": [
+            file_entry("top.py", modified=datetime(2026, 1, 3, tzinfo=UTC)),
+            file_entry("notes.txt", modified=datetime(2026, 1, 4, tzinfo=UTC)),
+            file_entry("big.py", size=2_000_000, modified=datetime(2026, 1, 5, tzinfo=UTC)),
+            file_entry("src", entry_type="directory"),
+            file_entry(".hidden", entry_type="directory"),
+        ],
+        "src": [file_entry("app", entry_type="directory")],
+        "src/app": [file_entry("main.py", modified=datetime(2026, 1, 1, tzinfo=UTC))],
+        ".hidden": [file_entry("x.py", modified=datetime(2026, 1, 2, tzinfo=UTC))],
+    }
+    return tree[path]
+
+
+def _sample_bytes(path: str, timeout: float = 60) -> bytes:
+    """File bodies matching :func:`_sample_tree`."""
+    del timeout
+    bodies = {
+        "top.py": b"hello\nhello\n",
+        "notes.txt": b"hello\n",
+        "big.py": b"hello\n",
+        "src/app/main.py": b"no\n",
+        ".hidden/x.py": b"\xff",
+    }
+    return bodies[path]
 
 
 def _make_sandbox(**overrides: object) -> tuple[KubernetesSandbox, MagicMock, MagicMock]:
@@ -2354,3 +2404,232 @@ class TestVolumeClaimTemplates:
     def test_default_is_none(self) -> None:
         sb, _, _ = _make_sandbox()
         assert sb._volume_claim_templates is None
+
+
+# ---------------------------------------------------------------------------
+# SandboxdBackend — REST file tools
+# ---------------------------------------------------------------------------
+
+
+class TestSandboxdBackend:
+    def test_default_connection_is_sandboxd_tunnel(self) -> None:
+        from k8s_agent_sandbox.models import SandboxdPodTunnelConnectionConfig
+
+        sb = SandboxdBackend(warmpool_name="sandboxd-pool", namespace="ns")
+        assert isinstance(sb._connection_config, SandboxdPodTunnelConnectionConfig)
+        assert sb._sandboxd_root == "/workspace"
+        assert isinstance(sb, BaseSandbox)
+
+    def test_init_does_not_contact_the_cluster(self) -> None:
+        with patch("k8s_agent_sandbox.SandboxClient") as mocked:
+            sb = SandboxdBackend(warmpool_name="sandboxd-pool", namespace="ns")
+            mocked.assert_not_called()
+            assert sb._started is False
+
+    def test_rejects_router_connection_modes(self) -> None:
+        from k8s_agent_sandbox.models import SandboxLocalTunnelConnectionConfig
+
+        with pytest.raises(ValueError, match="api_url"):
+            SandboxdBackend(warmpool_name="p", namespace="n", api_url="http://router")
+        with pytest.raises(ValueError, match="gateway_name"):
+            SandboxdBackend(warmpool_name="p", namespace="n", gateway_name="gw")
+        with pytest.raises(ValueError, match="SandboxdPodTunnelConnectionConfig"):
+            SandboxdBackend(
+                warmpool_name="p",
+                namespace="n",
+                connection_config=SandboxLocalTunnelConnectionConfig(),
+            )
+
+    def test_rejects_non_sandboxd_handle(self) -> None:
+        handle = MagicMock()
+        handle.claim_name = "claim"
+        handle.connector.is_sandboxd.return_value = False
+        with pytest.raises(ValueError, match="sandboxd runtime"):
+            SandboxdBackend(sandbox=handle)
+
+    def test_path_mapping(self) -> None:
+        sb = SandboxdBackend(warmpool_name="p", namespace="n")
+        mapped = sb._to_rest_path("/workspace/src/a.py", mutate=False)
+        assert mapped.error is None
+        assert mapped.relative == "src/a.py"
+        assert mapped.absolute == "/workspace/src/a.py"
+
+        outside = sb._to_rest_path("/etc/passwd", mutate=False)
+        assert outside.code == "invalid_path"
+
+        capture = sb._to_rest_path("/large_tool_results/tc", mutate=False)
+        assert capture.relative == "large_tool_results/tc"
+        assert capture.absolute == "/workspace/large_tool_results/tc"
+
+    def test_virtual_mode_does_not_double_the_root(self) -> None:
+        sb = SandboxdBackend(warmpool_name="p", namespace="n", virtual_mode=True, root_dir="/workspace")
+        mapped = sb._to_rest_path("/src/a.py", mutate=False)
+        assert mapped.absolute == "/workspace/src/a.py"
+        assert mapped.relative == "src/a.py"
+
+    def test_allow_prefixes_checked_on_resolved_path(self) -> None:
+        sb = SandboxdBackend(warmpool_name="p", namespace="n", allow_prefixes=["/tmp"])
+        denied = sb._to_rest_path("/workspace/a.txt", mutate=True)
+        assert denied.code == "permission_denied"
+        assert denied.error is not None
+        assert "not under any allowed prefix" in denied.error
+        allowed_read = sb._to_rest_path("/workspace/a.txt", mutate=False)
+        assert allowed_read.error is None
+
+    def test_write_read_edit_ls_delete_use_rest(self) -> None:
+        with _sandboxd() as (sb, handle):
+            written = sb.write("/workspace/a.txt", "hi")
+            assert written.error is None
+            assert written.path == "/workspace/a.txt"
+            handle.files.write.assert_called_with("a.txt", b"hi", timeout=sb._command_timeout)
+            handle.commands.run.assert_not_called()
+
+            handle.files.read.return_value = b"one\ntwo\nthree\n"
+            read = sb.read("/workspace/a.txt", offset=1, limit=1)
+            assert read.error is None
+            assert read.file_data is not None
+            assert read.file_data["content"] == "two\n"
+            assert read.start_line == 2
+
+            handle.files.read.return_value = b"one one"
+            ambiguous = sb.edit("/workspace/a.txt", "one", "two")
+            assert ambiguous.error is not None
+            assert "appears 2 times" in ambiguous.error
+
+            replaced = sb.edit("/workspace/a.txt", "one", "two", replace_all=True)
+            assert replaced.error is None
+            assert replaced.occurrences == 2
+            handle.files.write.assert_called_with("a.txt", b"two two", timeout=sb._command_timeout)
+
+            handle.files.list.return_value = [
+                file_entry("b.txt"),
+                file_entry("a.txt"),
+                file_entry("dir", entry_type="directory"),
+            ]
+            listed = sb.ls("/workspace")
+            assert listed.error is None
+            assert listed.entries is not None
+            assert [entry["path"] for entry in listed.entries] == [
+                "/workspace/a.txt",
+                "/workspace/b.txt",
+                "/workspace/dir",
+            ]
+            assert listed.entries[2]["is_dir"] is True
+
+            handle.files.exists.return_value = False
+            missing = sb.delete("/workspace/a.txt")
+            assert missing.error == "file_not_found"
+            handle.files.delete.assert_not_called()
+
+            handle.files.exists.return_value = True
+            removed = sb.delete("/workspace/a.txt")
+            assert removed.error is None
+            handle.files.delete.assert_called_once_with("a.txt", recursive=True, timeout=sb._command_timeout)
+
+    def test_read_detects_a_directory_listing(self) -> None:
+        with _sandboxd() as (sb, handle):
+            handle.files.read.return_value = b'{"entries": []}'
+            handle.files.list.return_value = [file_entry("sub", entry_type="directory")]
+            listing = sb.read("/workspace/sub")
+            assert listing.error == "is_directory"
+
+            handle.files.list.return_value = [file_entry("sub", entry_type="file")]
+            text = sb.read("/workspace/sub")
+            assert text.error is None
+            assert text.file_data is not None
+            assert text.file_data["content"] == '{"entries": []}'
+
+    def test_http_status_mapping(self) -> None:
+        with _sandboxd() as (sb, handle):
+            handle.files.read.side_effect = sandbox_request_error(404)
+            assert sb.read("/workspace/missing.txt").error == "file_not_found"
+
+            handle.files.write.side_effect = sandbox_request_error(403)
+            denied = sb.write("/workspace/a.txt", "hi")
+            assert denied.error is not None
+            assert "PermissionError" in denied.error
+            assert "permission_denied" in denied.error
+
+            handle.files.exists.return_value = True
+            handle.files.delete.side_effect = sandbox_request_error(409)
+            assert sb.delete("/workspace/a.txt").error == "is_directory"
+
+    def test_glob_semantics(self) -> None:
+        with _sandboxd() as (sb, handle):
+            handle.files.list.side_effect = _sample_tree
+            found = sb.glob("*.py")
+            assert found.error is None
+            assert found.matches is not None
+            assert [item["path"] for item in found.matches] == [
+                "/workspace/big.py",
+                "/workspace/top.py",
+                "/workspace/.hidden/x.py",
+                "/workspace/src/app/main.py",
+            ]
+
+            starstar = sb.glob("**/*.py")
+            assert starstar.matches is not None
+            assert "/workspace/.hidden/x.py" not in [item["path"] for item in starstar.matches]
+            assert "/workspace/src/app/main.py" in [item["path"] for item in starstar.matches]
+
+    def test_grep_caps_skips_and_filters(self) -> None:
+        with _sandboxd() as (sb, handle):
+            handle.files.list.side_effect = _sample_tree
+            handle.files.read.side_effect = _sample_bytes
+
+            capped = sb.grep("hello", max_count=1)
+            assert capped.truncated is True
+            assert capped.matches is not None
+            assert len(capped.matches) == 1
+            assert capped.matches[0]["path"] == "/workspace/top.py"
+            assert capped.matches[0]["line"] == 1
+
+            read_paths = [call.args[0] for call in handle.files.read.call_args_list]
+            assert "big.py" not in read_paths
+
+            handle.files.read.reset_mock()
+            handle.files.read.side_effect = _sample_bytes
+            filtered = sb.grep("hello", glob="*.txt")
+            assert filtered.truncated is False
+            assert filtered.matches is not None
+            assert [item["path"] for item in filtered.matches] == ["/workspace/notes.txt"]
+
+            binary = sb.grep("hello", path="/workspace/.hidden")
+            assert binary.matches == []
+
+    def test_upload_and_download(self) -> None:
+        with _sandboxd() as (sb, handle):
+            uploaded = sb.upload_files(
+                [
+                    ("/workspace/a.txt", b"aaa"),
+                    ("/etc/passwd", b"nope"),
+                ]
+            )
+            assert uploaded[0].error is None
+            assert uploaded[1].error == "invalid_path"
+            handle.files.write.assert_called_once_with("a.txt", b"aaa", timeout=sb._command_timeout)
+
+            handle.files.read.return_value = b"aaa"
+            downloaded = sb.download_files(["/workspace/a.txt", "/etc/passwd"])
+            assert downloaded[0].error is None
+            assert downloaded[0].content == b"aaa"
+            assert downloaded[1].error == "invalid_path"
+
+    async def test_aread_uses_the_sync_rest_read(self) -> None:
+        with _sandboxd() as (sb, handle):
+            handle.files.read.return_value = b"async\n"
+            result = await sb.aread("/workspace/a.txt")
+            assert result.file_data is not None
+            assert "async" in result.file_data["content"]
+            handle.files.read.assert_called_once()
+            handle.commands.run.assert_not_called()
+
+    def test_offload_reroots_the_capture_file(self) -> None:
+        with _sandboxd(enable_capture_offload=True) as (sb, handle):
+            handle.commands.run.return_value = FakeExecutionResult(
+                stdout="__DEEPAGENTS_EXEC_META__ 0 0 0 0\nshort\n",
+                exit_code=0,
+            )
+            sb.execute_with_offload("echo hi", "/large_tool_results/tc", max_inline_bytes=100)
+            command = handle.commands.run.call_args[0][0]
+            assert "/workspace/large_tool_results/tc" in command

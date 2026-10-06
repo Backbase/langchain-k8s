@@ -135,7 +135,20 @@ if [[ "${WARMPOOL_REPLICAS}" != "0" ]]; then
         || warn "warm pool did not report Ready — continuing, tests will cold-start"
 fi
 
-# ── 6. Verification ─────────────────────────────────────────────────
+# ── 6. sandboxd runtime ─────────────────────────────────────────────
+#
+# SandboxdBackend file tools use the REST API, so they work without python3.
+# The staging image still has no python3; the integration test asserts that.
+# replicas stays 0 in the manifest. The image is not preloaded — the node
+# pulls latest-main on the first claim.
+
+info "Creating SandboxTemplate 'sandboxd-template'"
+kubectl apply -f "${PROJECT_DIR}/k8s/sandboxd-template.yaml"
+
+info "Creating SandboxWarmPool 'sandboxd-pool'"
+kubectl apply -f "${PROJECT_DIR}/k8s/sandboxd-warmpool.yaml"
+
+# ── 7. Verification ─────────────────────────────────────────────────
 
 info "Verifying CRDs"
 kubectl get crd sandboxes.agents.x-k8s.io &>/dev/null \

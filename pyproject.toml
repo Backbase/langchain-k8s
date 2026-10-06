@@ -22,6 +22,9 @@ dependencies = [
     "k8s-agent-sandbox>=1.0.4",
 ]
 
+[project.optional-dependencies]
+sandboxd = ["k8s-agent-sandbox[grpc]>=1.0.4"]
+
 [project.urls]
 Homepage = "https://github.com/uesleilima/langchain-k8s"
 Repository = "https://github.com/uesleilima/langchain-k8s"

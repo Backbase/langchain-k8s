@@ -869,6 +869,11 @@ dependencies = [
     { name = "k8s-agent-sandbox" },
 ]
 
+[package.optional-dependencies]
+sandboxd = [
+    { name = "k8s-agent-sandbox", extra = ["grpc"] },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "k8s-agent-sandbox", extra = ["grpc"] },
@@ -884,7 +889,9 @@ dev = [
 requires-dist = [
     { name = "deepagents", specifier = ">=0.7.21" },
     { name = "k8s-agent-sandbox", specifier = ">=1.0.4" },
+    { name = "k8s-agent-sandbox", extras = ["grpc"], marker = "extra == 'sandboxd'", specifier = ">=1.0.4" },
 ]
+provides-extras = ["sandboxd"]
 
 [package.metadata.requires-dev]
 dev = [

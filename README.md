@@ -232,9 +232,31 @@ backend = KubernetesSandbox(
 
 ### sandboxd
 
-`SandboxdPodTunnelConnectionConfig` is accepted by `connection_config` with no extra code. It port-forwards to sandboxd's REST port 8080 and gRPC port 9090, and `execute` then runs over gRPC. That import needs the SDK's grpc extra (`pip install 'k8s-agent-sandbox[grpc]'`).
+`SandboxdBackend` is the backend for a sandboxd pod. `execute` still runs over gRPC (`commands.run` on port 9090). `read`, `write`, `edit`, `ls`, `grep`, `glob`, `delete`, `upload_files` and `download_files` use sandboxd's REST filesystem API (`/v1/files` on port 8080), so they do not need `python3` inside the container. The stock `sandboxd:latest-main` image is enough.
 
-The staging image `sandboxd:latest-main` has no `python3`. Shell `execute` works against it. `read`, `write`, `edit` and `glob` fail, and `ls` and `grep` can return an empty success, because those tools ship `python3 -c` scripts into the container. `k8s/sandboxd-template.yaml` records that image for a local experiment and is not applied by `kind-setup.sh`. `tests/integration/test_sandboxd_kind.py` covers that shell path and skips when the pool is absent. A usable sandboxd backend needs an image that contains `python3` (upstream's "topology B": sandboxd injected into a tool-rich image).
+```bash
+pip install 'langchain-k8s[sandboxd]'
+```
+
+```python
+from langchain_k8s import SandboxdBackend
+
+backend = SandboxdBackend(
+    warmpool_name="sandboxd-pool",
+    namespace="agent-sandbox-system",
+)
+backend.write("/workspace/src/a.py", "print('hi')\n")
+```
+
+The constructor defaults `connection_config` to `SandboxdPodTunnelConnectionConfig`. `api_url` and `gateway_name` are rejected: the sandbox router cannot proxy gRPC. To attach a handle that a sandboxd client already created, pass `sandbox=handle`. `create_kubernetes_sandbox` still returns a `KubernetesSandbox`.
+
+Agent paths are real absolute paths, and every file tool confines them to `sandboxd_root` (default `/workspace`, the daemon's `--root-dir`). A path outside that root comes back as `invalid_path`. With `virtual_mode` on, set `root_dir` under `/workspace`.
+
+`FilesystemMiddleware` records oversized `execute` output at `/large_tool_results/<id>` and later `read_file`s that pointer. Both the shell write and the later read are rerooted to `/workspace/large_tool_results/<id>`, so the pointer opens. Set `enable_capture_offload=True` for that path; `SandboxdBackend` stays a `BaseSandbox`, which is what the middleware checks before it offloads.
+
+`grep` and `glob` walk the tree over REST: one `list` per directory, and `grep` reads each candidate file. That is one HTTP call per directory (and per file, for `grep`), not a single in-pod `python3` scan. Files larger than `grep_max_file_bytes` (default 1 MiB) and files that are not UTF-8 are skipped.
+
+`scripts/kind-setup.sh` applies `k8s/sandboxd-template.yaml` and `k8s/sandboxd-warmpool.yaml`. `tests/integration/test_sandboxd_kind.py` covers the native file tools and skips when the pool is absent.
 
 ## Sandbox lifecycle
 
@@ -710,12 +732,15 @@ The setup script will:
 3. Deploy the sandbox router
 4. Apply the `python-sandbox-template` SandboxTemplate
 5. Apply the `python-sandbox-pool` SandboxWarmPool (`replicas: 0` by default; set `WARMPOOL_REPLICAS` to pre-warm pods instead)
+6. Apply the `sandboxd-template` SandboxTemplate and `sandboxd-pool` SandboxWarmPool
 
 ```
 k8s/
 ├── sandbox-router.yaml            # Router Deployment + Service
 ├── sandbox-template.yaml          # SandboxTemplate for Python runtime
-└── sandbox-warmpool.yaml          # SandboxWarmPool claims reference
+├── sandbox-warmpool.yaml          # SandboxWarmPool claims reference
+├── sandboxd-template.yaml         # SandboxTemplate for the sandboxd runtime
+└── sandboxd-warmpool.yaml         # SandboxWarmPool for sandboxd
 ```
 
 ---

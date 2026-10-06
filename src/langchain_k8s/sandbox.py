@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import posixpath
 import shlex
 import threading
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from deepagents.backends.protocol import (
@@ -17,15 +19,24 @@ from deepagents.backends.protocol import (
     ExecuteOffloadResult,
     ExecuteResponse,
     FileDownloadResponse,
+    FileInfo,
     FileOperationError,
     FileUploadResponse,
     GlobResult,
+    GrepMatch,
     GrepResult,
     LsResult,
     ReadResult,
     WriteResult,
 )
 from deepagents.backends.sandbox import BaseSandbox
+from deepagents.backends.utils import (
+    InvalidGlobPatternError,
+    compile_grep_include_glob,
+    create_file_data,
+    perform_string_replacement,
+    slice_read_response,
+)
 
 from langchain_k8s.proxy import patch_k8s_proxy_config
 
@@ -47,6 +58,9 @@ _DEFAULT_MAX_OUTPUT_SIZE = 1_048_576  # 1 MB
 _DEFAULT_COMMAND_TIMEOUT = 300  # 5 minutes
 _DEFAULT_ROOT_DIR = "/tmp"
 _DEFAULT_ROUTER_NAMESPACE = "agent-sandbox-system"
+_DEFAULT_SANDBOXD_ROOT = "/workspace"
+_DEFAULT_GREP_MAX_FILE_BYTES = 1_048_576
+_CAPTURE_PREFIX = "/large_tool_results"
 
 
 class KubernetesSandbox(BaseSandbox):
@@ -1348,6 +1362,547 @@ class KubernetesSandbox(BaseSandbox):
 
         logger.debug("_create_client: connection_config=%s", resolved_config)
         return _SandboxClient(connection_config=resolved_config)
+
+
+@dataclass(frozen=True)
+class _MappedPath:
+    """Absolute sandbox path plus the sandboxd-relative path the REST API expects."""
+
+    absolute: str
+    relative: str
+    error: str | None = None
+    code: FileOperationError | None = None
+
+
+class SandboxdBackend(KubernetesSandbox):
+    """Sandbox backend whose file tools speak sandboxd's REST filesystem API.
+
+    ``execute`` still runs over gRPC ``ProcessService``. ``read``, ``write``,
+    ``edit``, ``ls``, ``grep``, ``glob``, ``delete``, ``upload_files`` and
+    ``download_files`` use ``PUT``/``GET``/``HEAD``/``DELETE`` on
+    ``/v1/files`` instead of the ``python3 -c`` scripts ``BaseSandbox``
+    ships through the shell. The stock ``sandboxd`` image has no Python
+    interpreter, so those scripts cannot run there.
+
+    The class stays a :class:`~deepagents.backends.sandbox.BaseSandbox`.
+    ``FilesystemMiddleware`` only offloads large ``execute`` output for that
+    type; dropping the base class would silently disable capture offload.
+
+    Paths are real absolute paths. The REST API only sees files under
+    ``sandboxd_root`` (the daemon's ``--root-dir``, ``/workspace`` by
+    default). ``/workspace/src/a.py`` is sent as ``src/a.py``. A path
+    outside that root is an ``invalid_path`` error.
+
+    ``FilesystemMiddleware`` writes oversized ``execute`` output to
+    ``/large_tool_results/<id>``, which is outside ``/workspace``. That
+    prefix is rerooted to ``<sandboxd_root>/large_tool_results`` on both
+    the shell write and the later ``read``, so the pointer still resolves.
+    ``allow_prefixes`` does not apply to that capture file.
+
+    ``grep`` and ``glob`` walk the tree with one REST listing per directory
+    and, for ``grep``, one read per file. Files larger than
+    ``grep_max_file_bytes`` and files that are not UTF-8 are skipped.
+    """
+
+    def __init__(
+        self,
+        *,
+        sandboxd_root: str = _DEFAULT_SANDBOXD_ROOT,
+        grep_max_file_bytes: int = _DEFAULT_GREP_MAX_FILE_BYTES,
+        connection_config: SandboxConnectionConfig | None = None,
+        api_url: str | None = None,
+        gateway_name: str | None = None,
+        sandbox: Sandbox | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialise a sandboxd backend.
+
+        Args:
+            sandboxd_root: Absolute directory the sandboxd daemon confines
+                its filesystem API to. Matches ``--root-dir``.
+            grep_max_file_bytes: Skip files larger than this during
+                ``grep``. The file is not downloaded.
+            connection_config: Must be a ``SandboxdPodTunnelConnectionConfig``
+                when supplied. The default port-forwards REST ``8080`` and
+                gRPC ``9090`` to the pod.
+            api_url: Rejected. The sandbox router cannot proxy gRPC.
+            gateway_name: Rejected. The sandbox router cannot proxy gRPC.
+            sandbox: Pre-created handle from a sandboxd client. Lifecycle
+                stays with the caller, as in :class:`KubernetesSandbox`.
+            **kwargs: Forwarded to :class:`KubernetesSandbox`, including
+                ``warmpool_name``, ``namespace``, ``env`` and
+                ``enable_capture_offload``.
+
+        Raises:
+            ValueError: If ``api_url`` or ``gateway_name`` is set, if
+                ``connection_config`` is not a sandboxd tunnel config, if
+                ``sandboxd_root`` is not absolute, or if ``sandbox`` is a
+                handle whose connector is not the sandboxd runtime.
+        """
+        if api_url is not None or gateway_name is not None:
+            msg = "SandboxdBackend cannot use api_url or gateway_name; the sandbox router cannot proxy gRPC"
+            raise ValueError(msg)
+        if grep_max_file_bytes < 0:
+            msg = "grep_max_file_bytes must be greater than or equal to zero"
+            raise ValueError(msg)
+        root = posixpath.normpath(sandboxd_root)
+        if not root.startswith("/"):
+            msg = f"sandboxd_root must be an absolute path, got {sandboxd_root!r}"
+            raise ValueError(msg)
+
+        # Imported here so constructing the config does not pull the SDK in
+        # at module import, and so __init__ still never contacts the cluster.
+        from k8s_agent_sandbox.models import SandboxdPodTunnelConnectionConfig
+
+        if connection_config is None:
+            connection_config = SandboxdPodTunnelConnectionConfig()
+        elif not isinstance(connection_config, SandboxdPodTunnelConnectionConfig):
+            msg = "SandboxdBackend requires a SandboxdPodTunnelConnectionConfig"
+            raise ValueError(msg)
+
+        if sandbox is not None:
+            connector = getattr(sandbox, "connector", None)
+            is_sandboxd = getattr(connector, "is_sandboxd", None)
+            if callable(is_sandboxd) and is_sandboxd() is False:
+                msg = "SandboxdBackend handle must use the sandboxd runtime"
+                raise ValueError(msg)
+
+        self._sandboxd_root = root
+        self._grep_max_file_bytes = grep_max_file_bytes
+        super().__init__(
+            sandbox=sandbox,
+            connection_config=connection_config,
+            **kwargs,
+        )
+
+    def execute_with_offload(
+        self,
+        command: str,
+        capture_path: str,
+        *,
+        max_inline_bytes: int,
+        max_capture_bytes: int | None = None,
+        timeout: int | None = None,
+    ) -> ExecuteOffloadResult:
+        """Write the capture file where a later REST read of the pointer looks.
+
+        ``/large_tool_results/<id>`` is rerooted under ``sandboxd_root``
+        before the shell wrapper runs. The pointer the middleware keeps is
+        still the original path; :meth:`read` applies the same reroot.
+        """
+        try:
+            resolved = self._resolve_virtual_path(capture_path)
+            resolved = self._reroot_capture(resolved)
+        except ValueError as exc:
+            logger.debug(
+                "execute_with_offload: capture path rejected path=%r reason=%s",
+                capture_path,
+                exc,
+            )
+            return ExecuteOffloadResult(offloaded=False, response=self.execute(command, timeout=timeout))
+        return super().execute_with_offload(
+            command,
+            resolved,
+            max_inline_bytes=max_inline_bytes,
+            max_capture_bytes=max_capture_bytes,
+            timeout=timeout,
+        )
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        """Create or overwrite a file through sandboxd's REST ``PUT``."""
+        mapped = self._to_rest_path(file_path, mutate=True)
+        if mapped.error is not None:
+            return WriteResult(error=mapped.error)
+        if not mapped.relative:
+            return WriteResult(error=f"Path {mapped.absolute!r} does not name a file")
+        try:
+            self._filesystem().write(mapped.relative, content.encode("utf-8"), timeout=self._command_timeout)
+        except Exception as exc:
+            return WriteResult(error=self._file_error_message(exc, file_path, op="write"))
+        return WriteResult(path=mapped.absolute)
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        """Read a file through sandboxd's REST ``GET`` and slice the requested lines."""
+        mapped = self._to_rest_path(file_path, mutate=False)
+        if mapped.error is not None:
+            return ReadResult(error=mapped.error)
+        if not mapped.relative:
+            return ReadResult(error="is_directory")
+        try:
+            payload = self._filesystem().read(mapped.relative, timeout=self._command_timeout)
+        except Exception as exc:
+            return ReadResult(error=self._file_error_message(exc, file_path, op="read"))
+        if self._is_directory_payload(mapped.relative, payload):
+            return ReadResult(error="is_directory")
+        try:
+            text = payload.decode("utf-8")
+            file_data = create_file_data(text)
+        except UnicodeDecodeError:
+            file_data = create_file_data(base64.b64encode(payload).decode("ascii"), encoding="base64")
+        return slice_read_response(file_data, offset, limit)
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,  # noqa: FBT001, FBT002
+    ) -> EditResult:
+        """Replace an exact string by reading and writing the file over REST."""
+        mapped = self._to_rest_path(file_path, mutate=True)
+        if mapped.error is not None:
+            return EditResult(error=mapped.error)
+        if not mapped.relative:
+            return EditResult(error="is_directory")
+        try:
+            payload = self._filesystem().read(mapped.relative, timeout=self._command_timeout)
+        except Exception as exc:
+            return EditResult(error=self._file_error_message(exc, file_path, op="edit"))
+        if self._is_directory_payload(mapped.relative, payload):
+            return EditResult(error="is_directory")
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return EditResult(error=f"File {mapped.absolute!r} is not valid UTF-8")
+        replaced = perform_string_replacement(text, old_string, new_string, replace_all)
+        if isinstance(replaced, str):
+            return EditResult(error=replaced)
+        new_content, occurrences = replaced
+        try:
+            self._filesystem().write(mapped.relative, new_content.encode("utf-8"), timeout=self._command_timeout)
+        except Exception as exc:
+            return EditResult(error=self._file_error_message(exc, file_path, op="edit"))
+        return EditResult(path=mapped.absolute, occurrences=occurrences)
+
+    def ls(self, path: str) -> LsResult:
+        """List one directory through sandboxd's REST directory listing."""
+        mapped = self._to_rest_path(path, mutate=False)
+        if mapped.error is not None:
+            return LsResult(error=mapped.error)
+        try:
+            entries = self._filesystem().list(mapped.relative, timeout=self._command_timeout)
+        except Exception as exc:
+            return LsResult(error=self._file_error_message(exc, path, op="ls"))
+        infos = [
+            self._file_info(entry.name if not mapped.relative else f"{mapped.relative}/{entry.name}", entry)
+            for entry in entries
+        ]
+        infos.sort(key=lambda info: info["path"])
+        return LsResult(entries=infos)
+
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+        """Find files by walking sandboxd listings and applying the shared glob contract."""
+        try:
+            matcher = compile_grep_include_glob(pattern)
+        except InvalidGlobPatternError as exc:
+            return GlobResult(error=str(exc))
+        start, error = self._search_root(path)
+        if error is not None or start is None:
+            return GlobResult(error=error)
+        files, walk_error = self._collect_files(start.relative)
+        if walk_error is not None:
+            return GlobResult(error=walk_error)
+        matches: list[FileInfo] = []
+        for relative, entry in files:
+            search_rel = self._relative_to(relative, start.relative)
+            if matcher(search_rel):
+                matches.append(self._file_info(relative, entry))
+        matches.sort(key=lambda info: info.get("modified_at", ""), reverse=True)
+        return GlobResult(matches=matches)
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        *,
+        max_count: int | None = None,
+    ) -> GrepResult:
+        """Search file text by walking sandboxd and reading each candidate over REST."""
+        if max_count is not None and max_count < 0:
+            return GrepResult(error="max_count must be greater than or equal to zero")
+        matcher = None
+        if glob is not None:
+            try:
+                matcher = compile_grep_include_glob(glob)
+            except InvalidGlobPatternError as exc:
+                return GrepResult(error=str(exc))
+        start, error = self._search_root(path)
+        if error is not None or start is None:
+            return GrepResult(error=error)
+        files, walk_error = self._collect_files(start.relative)
+        if walk_error is not None:
+            return GrepResult(error=walk_error)
+        matches: list[GrepMatch] = []
+        truncated = False
+        for relative, entry in files:
+            if truncated:
+                break
+            search_rel = self._relative_to(relative, start.relative)
+            if matcher is not None and not matcher(search_rel):
+                continue
+            if entry.size > self._grep_max_file_bytes:
+                logger.debug("grep: skipping oversized file path=%s size=%d", relative, entry.size)
+                continue
+            try:
+                payload = self._filesystem().read(relative, timeout=self._command_timeout)
+            except Exception as exc:
+                logger.debug("grep: skipping unreadable file path=%s reason=%s", relative, exc)
+                continue
+            try:
+                text = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                logger.debug("grep: skipping non-utf8 file path=%s", relative)
+                continue
+            absolute = self._absolute_from_relative(relative)
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                if pattern not in line:
+                    continue
+                if max_count is not None and len(matches) >= max_count:
+                    truncated = True
+                    break
+                matches.append(GrepMatch(path=absolute, line=line_number, text=line))
+        return GrepResult(matches=matches, truncated=truncated)
+
+    def delete(self, file_path: str) -> DeleteResult:
+        """Delete a path recursively through sandboxd's REST ``DELETE``."""
+        mapped = self._to_rest_path(file_path, mutate=True)
+        if mapped.error is not None:
+            return DeleteResult(error=mapped.error)
+        if not mapped.relative:
+            return DeleteResult(error=f"Path {mapped.absolute!r} is the sandboxd root and cannot be deleted")
+        try:
+            filesystem = self._filesystem()
+            if not filesystem.exists(mapped.relative, timeout=self._command_timeout):
+                return DeleteResult(error="file_not_found")
+            filesystem.delete(mapped.relative, recursive=True, timeout=self._command_timeout)
+        except Exception as exc:
+            return DeleteResult(error=self._file_error_message(exc, file_path, op="delete"))
+        return DeleteResult(path=mapped.absolute)
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        """Upload files with one sandboxd REST ``PUT`` each."""
+        results: list[FileUploadResponse] = []
+        for path, content in files:
+            mapped = self._to_rest_path(path, mutate=True)
+            if mapped.error is not None:
+                results.append(FileUploadResponse(path=path, error=mapped.code or "invalid_path"))
+                continue
+            if not mapped.relative:
+                results.append(FileUploadResponse(path=path, error="invalid_path"))
+                continue
+            try:
+                self._filesystem().write(mapped.relative, content, timeout=self._command_timeout)
+            except Exception as exc:
+                code, _message = self._classify_exception(exc)
+                results.append(FileUploadResponse(path=path, error=code))
+                continue
+            results.append(FileUploadResponse(path=path, error=None))
+        return results
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        """Download files with one sandboxd REST ``GET`` each."""
+        results: list[FileDownloadResponse] = []
+        for path in paths:
+            mapped = self._to_rest_path(path, mutate=False)
+            if mapped.error is not None:
+                results.append(FileDownloadResponse(path=path, content=None, error=mapped.code or "invalid_path"))
+                continue
+            if not mapped.relative:
+                results.append(FileDownloadResponse(path=path, content=None, error="is_directory"))
+                continue
+            try:
+                payload = self._filesystem().read(mapped.relative, timeout=self._command_timeout)
+            except Exception as exc:
+                code, _message = self._classify_exception(exc)
+                results.append(FileDownloadResponse(path=path, content=None, error=code))
+                continue
+            if self._is_directory_payload(mapped.relative, payload):
+                results.append(FileDownloadResponse(path=path, content=None, error="is_directory"))
+                continue
+            results.append(FileDownloadResponse(path=path, content=payload, error=None))
+        return results
+
+    def _to_rest_path(self, path: str, *, mutate: bool) -> _MappedPath:
+        """Map an agent path to a sandboxd-relative REST path.
+
+        Virtual-mode resolution runs first and stays idempotent. Mutating
+        calls then apply ``allow_prefixes`` to that resolved path. The
+        capture prefix is rerooted under ``sandboxd_root`` afterwards, and
+        is exempt from ``allow_prefixes``. Anything still outside the root
+        is ``invalid_path``.
+        """
+        try:
+            resolved = self._resolve_virtual_path(path)
+        except ValueError as exc:
+            return _MappedPath(absolute="", relative="", error=str(exc), code="invalid_path")
+        resolved = posixpath.normpath(resolved)
+        rerooted = self._reroot_capture(resolved)
+        if mutate and rerooted == resolved:
+            allow_error = self._check_allow_prefix(resolved)
+            if allow_error is not None:
+                return _MappedPath(absolute=resolved, relative="", error=allow_error, code="permission_denied")
+        if not self._is_under_root(rerooted):
+            message = f"Path {rerooted!r} is outside sandboxd root {self._sandboxd_root!r}"
+            return _MappedPath(absolute=rerooted, relative="", error=message, code="invalid_path")
+        return _MappedPath(absolute=rerooted, relative=self._relative_to_root(rerooted))
+
+    def _reroot_capture(self, resolved: str) -> str:
+        """Move ``/large_tool_results`` under ``sandboxd_root`` when it is outside it."""
+        if self._is_under_root(resolved):
+            return resolved
+        if resolved == _CAPTURE_PREFIX or resolved.startswith(_CAPTURE_PREFIX + "/"):
+            return self._sandboxd_root.rstrip("/") + resolved
+        return resolved
+
+    def _is_under_root(self, path: str) -> bool:
+        root = self._sandboxd_root
+        if root == "/":
+            return path.startswith("/")
+        return path == root or path.startswith(root + "/")
+
+    def _relative_to_root(self, absolute: str) -> str:
+        root = self._sandboxd_root
+        if absolute == root:
+            return ""
+        if root == "/":
+            return absolute[1:]
+        return absolute[len(root) + 1 :]
+
+    def _absolute_from_relative(self, relative: str) -> str:
+        if not relative:
+            return self._sandboxd_root
+        if self._sandboxd_root == "/":
+            return "/" + relative
+        return f"{self._sandboxd_root}/{relative}"
+
+    def _relative_to(self, path: str, start: str) -> str:
+        """Return *path* relative to the search root *start*."""
+        if not start:
+            return path
+        prefix = start + "/"
+        if path.startswith(prefix):
+            return path[len(prefix) :]
+        return path
+
+    def _search_root(self, path: str | None) -> tuple[_MappedPath | None, str | None]:
+        """Resolve the directory ``grep`` and ``glob`` start from."""
+        if path is None:
+            path = self._root_dir if self._virtual_mode and self._root_dir is not None else self._sandboxd_root
+        mapped = self._to_rest_path(path, mutate=False)
+        if mapped.error is not None:
+            return None, mapped.error
+        return mapped, None
+
+    def _filesystem(self) -> Any:
+        """Return the SDK filesystem client, starting the sandbox if needed."""
+        self._ensure_sandbox()
+        assert self._sandbox is not None
+        files = self._sandbox.files
+        if files is None:
+            msg = "sandbox filesystem is closed"
+            raise RuntimeError(msg)
+        return files
+
+    def _collect_files(self, start_relative: str) -> tuple[list[tuple[str, Any]], str | None]:
+        """Walk *start_relative* and return ``(root-relative path, FileEntry)`` pairs."""
+        kind, entry, error = self._path_kind(start_relative)
+        if error is not None:
+            return [], error
+        if kind == "file":
+            if entry is None:
+                return [], "file_not_found"
+            return [(start_relative, entry)], None
+        found: list[tuple[str, Any]] = []
+        queue = [start_relative]
+        while queue:
+            current = queue.pop(0)
+            try:
+                children = self._filesystem().list(current, timeout=self._command_timeout)
+            except Exception as exc:
+                return found, self._file_error_message(exc, self._absolute_from_relative(current), op="ls")
+            for child in children:
+                child_rel = child.name if not current else f"{current}/{child.name}"
+                if child.type == "directory":
+                    queue.append(child_rel)
+                elif child.type == "file":
+                    found.append((child_rel, child))
+        return found, None
+
+    def _path_kind(self, relative: str) -> tuple[str, Any, str | None]:
+        """Classify *relative* as ``dir``, ``file`` or an error."""
+        if relative == "":
+            return "dir", None, None
+        parent = posixpath.dirname(relative)
+        name = posixpath.basename(relative)
+        try:
+            entries = self._filesystem().list(parent, timeout=self._command_timeout)
+        except Exception as exc:
+            return "", None, self._file_error_message(exc, self._absolute_from_relative(relative), op="ls")
+        for entry in entries:
+            if entry.name == name:
+                kind = "dir" if entry.type == "directory" else "file"
+                return kind, entry, None
+        return "", None, "file_not_found"
+
+    def _is_directory_payload(self, relative: str, payload: bytes) -> bool:
+        """Return whether *payload* is a directory listing for *relative*."""
+        if relative == "":
+            return True
+        try:
+            parsed = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(parsed, dict) or "entries" not in parsed:
+            return False
+        parent = posixpath.dirname(relative)
+        name = posixpath.basename(relative)
+        try:
+            entries = self._filesystem().list(parent, timeout=self._command_timeout)
+        except Exception:
+            logger.debug("read: directory listing for %s could not be confirmed", relative)
+            return True
+        return any(entry.name == name and entry.type == "directory" for entry in entries)
+
+    def _file_info(self, relative: str, entry: Any) -> FileInfo:
+        """Build a :class:`FileInfo` with an absolute path."""
+        return {
+            "path": self._absolute_from_relative(relative),
+            "is_dir": entry.type == "directory",
+            "size": entry.size,
+            "modified_at": entry.modified.isoformat(),
+        }
+
+    def _file_error_message(self, exc: Exception, path: str, *, op: str) -> str:
+        """Map an SDK exception to a result error string and log permission failures."""
+        code, message = self._classify_exception(exc)
+        if code == "permission_denied":
+            logger.warning(
+                "%s: sandboxd permission denied for path=%r. The REST API rejected the path under sandboxd root %r.",
+                op,
+                path,
+                self._sandboxd_root,
+            )
+        else:
+            logger.debug("%s: sandboxd path=%r failed (%s)", op, path, message)
+        return message
+
+    def _classify_exception(self, exc: Exception) -> tuple[FileOperationError, str]:
+        """Map an SDK exception to a file-operation code and a result message."""
+        from k8s_agent_sandbox.exceptions import SandboxRequestError
+
+        if isinstance(exc, SandboxRequestError):
+            status = exc.status_code
+            if status == 404:
+                return "file_not_found", "file_not_found"
+            if status == 403:
+                return "permission_denied", "PermissionError: permission_denied"
+            if status == 409:
+                return "is_directory", "is_directory"
+            return "file_not_found", f"file_not_found (HTTP {status})"
+        if isinstance(exc, ValueError):
+            return "invalid_path", str(exc)
+        return "file_not_found", str(exc)
 
 
 def create_kubernetes_sandbox(
