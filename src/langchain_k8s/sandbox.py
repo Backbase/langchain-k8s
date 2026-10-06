@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import posixpath
@@ -11,7 +12,9 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 from deepagents.backends.protocol import (
+    DeleteResult,
     EditResult,
+    ExecuteOffloadResult,
     ExecuteResponse,
     FileDownloadResponse,
     FileOperationError,
@@ -27,7 +30,10 @@ from deepagents.backends.sandbox import BaseSandbox
 from langchain_k8s.proxy import patch_k8s_proxy_config
 
 if TYPE_CHECKING:
-    from k8s_agent_sandbox import SandboxClient
+    # The 1.0.x package ships py.typed but no ``__all__``, so pyright treats
+    # this re-export as private. Importing from ``sandbox_client`` instead
+    # would miss the ``patch("k8s_agent_sandbox.SandboxClient")`` the tests use.
+    from k8s_agent_sandbox import SandboxClient  # pyright: ignore[reportPrivateImportUsage]
     from k8s_agent_sandbox.models import SandboxConnectionConfig
     from k8s_agent_sandbox.sandbox import Sandbox
 
@@ -91,9 +97,9 @@ class KubernetesSandbox(BaseSandbox):
     ~~~~~~~~~~~~~~~~~~
 
     The ``allow_prefixes`` parameter enforces a tool-level write policy.
-    When set, ``write()`` and ``edit()`` operations are only permitted for
-    paths that start with one of the given prefixes.  All other paths return
-    an error result without executing a command.
+    When set, ``write()``, ``edit()`` and ``delete()`` operations are only
+    permitted for paths that start with one of the given prefixes.  All
+    other paths return an error result without executing a command.
 
     By default (``allow_prefixes=None``) no restrictions are applied.
 
@@ -159,6 +165,7 @@ class KubernetesSandbox(BaseSandbox):
         reuse_sandbox: bool = True,
         max_output_size: int = _DEFAULT_MAX_OUTPUT_SIZE,
         command_timeout: int = _DEFAULT_COMMAND_TIMEOUT,
+        enable_capture_offload: bool = False,
         allow_prefixes: list[str] | None = None,
         root_dir: str | None = None,
         virtual_mode: bool = False,
@@ -170,6 +177,7 @@ class KubernetesSandbox(BaseSandbox):
         pod_labels: dict[str, str] | None = None,
         pod_annotations: dict[str, str] | None = None,
         volume_claim_templates: list[dict[str, Any]] | None = None,
+        env: dict[str, str] | None = None,
         router_namespace: str = _DEFAULT_ROUTER_NAMESPACE,
     ) -> None:
         """Initialise the backend.
@@ -210,10 +218,22 @@ class KubernetesSandbox(BaseSandbox):
             command_timeout: Default timeout in seconds for ``run()`` calls.
                 Can be overridden per-call via the ``timeout`` parameter
                 on ``execute()``.
-            allow_prefixes: List of path prefixes where ``write()`` and
-                ``edit()`` operations are allowed.  ``None`` (default) means
-                no restrictions.  When set, only paths starting with one of
-                these prefixes are writable; all others return an error.
+            enable_capture_offload: When ``True``, large ``execute`` output
+                is written to a file in the sandbox and the tool result
+                carries a preview plus a ``read_file`` pointer.  ``False``
+                (default) returns the full output inline, capped by
+                ``max_output_size``.  Keep ``max_output_size`` above the
+                middleware's inline budget, or the preview itself is
+                truncated before it can be parsed.  The capture file is
+                written by ``execute``, so ``allow_prefixes`` does not
+                apply; the directory (``/large_tool_results``, or
+                ``root_dir/large_tool_results`` when ``virtual_mode`` is
+                on) must be writable inside the container.
+            allow_prefixes: List of path prefixes where ``write()``,
+                ``edit()`` and ``delete()`` operations are allowed.  ``None``
+                (default) means no restrictions.  When set, only paths
+                starting with one of these prefixes are writable; all others
+                return an error.
                 The check runs against the **resolved** path (after virtual
                 mode resolution, if enabled).
 
@@ -314,6 +334,13 @@ class KubernetesSandbox(BaseSandbox):
                    container, and the cluster needs a working
                    ``StorageClass``.
 
+            env: Environment variables injected into the sandbox
+                container via ``spec.env``.  Creation-time only.  Setting
+                this forces a cold start from the warm-pool template
+                instead of adopting a pre-warmed pod, which raises
+                start-up latency.  Variable names are validated by the
+                SDK when the sandbox is created, not at construction.
+                Ignored when ``sandbox`` or ``claim_name`` is provided.
             router_namespace: Namespace of the ``sandbox-router-svc``
                 Service that automatic ``kubectl port-forward``
                 (development mode) tunnels into.  Only consulted when no
@@ -341,6 +368,7 @@ class KubernetesSandbox(BaseSandbox):
         self._reuse_sandbox = reuse_sandbox
         self._max_output_size = max_output_size
         self._command_timeout = command_timeout
+        self.enable_capture_offload = enable_capture_offload
         self._virtual_mode = virtual_mode
         self._skip_cleanup = skip_cleanup
         self._claim_name = claim_name
@@ -350,6 +378,7 @@ class KubernetesSandbox(BaseSandbox):
         self._pod_labels = pod_labels
         self._pod_annotations = pod_annotations
         self._volume_claim_templates = volume_claim_templates
+        self._env = env
         self._router_namespace = router_namespace
         self._owns_lifecycle = sandbox is None
 
@@ -552,6 +581,81 @@ class KubernetesSandbox(BaseSandbox):
         )
         return resp
 
+    def execute_with_offload(
+        self,
+        command: str,
+        capture_path: str,
+        *,
+        max_inline_bytes: int,
+        max_capture_bytes: int | None = None,
+        timeout: int | None = None,
+    ) -> ExecuteOffloadResult:
+        """Run *command*, leaving large output at a virtual-mode-resolved path.
+
+        ``FilesystemMiddleware`` builds ``capture_path`` under
+        ``/large_tool_results``.  With ``virtual_mode`` on, a later
+        ``read_file`` of that pointer is resolved under ``root_dir``, so
+        the file must be written at the resolved path or the pointer
+        misses.  ``_resolve_virtual_path`` is idempotent, so the read
+        lands on the same file.  A path that fails resolution falls back
+        to a plain ``execute`` with ``offloaded=False``.
+
+        ``allow_prefixes`` is not applied: the capture is written through
+        ``execute``, which is outside that policy.
+
+        Args:
+            command: Shell command to run.
+            capture_path: Where to leave output that exceeds the inline
+                budget.  Resolved through virtual mode when enabled.
+            max_inline_bytes: Output at or below this size is returned
+                inline.
+            max_capture_bytes: Hard cap on bytes written to
+                *capture_path*.
+            timeout: Per-command timeout in seconds.
+
+        Returns:
+            An :class:`~deepagents.backends.protocol.ExecuteOffloadResult`.
+        """
+        try:
+            resolved = self._resolve_virtual_path(capture_path)
+        except ValueError as exc:
+            logger.debug(
+                "execute_with_offload: capture path rejected path=%r reason=%s",
+                capture_path,
+                exc,
+            )
+            return ExecuteOffloadResult(offloaded=False, response=self.execute(command, timeout=timeout))
+        return super().execute_with_offload(
+            command,
+            resolved,
+            max_inline_bytes=max_inline_bytes,
+            max_capture_bytes=max_capture_bytes,
+            timeout=timeout,
+        )
+
+    async def aexecute_with_offload(
+        self,
+        command: str,
+        capture_path: str,
+        *,
+        max_inline_bytes: int,
+        max_capture_bytes: int | None = None,
+        timeout: int | None = None,  # noqa: ASYNC109
+    ) -> ExecuteOffloadResult:
+        """Async ``execute_with_offload`` that keeps the virtual-mode path fix.
+
+        The base implementation calls ``aexecute`` directly, which would
+        write the capture file at the unresolved path.
+        """
+        return await asyncio.to_thread(
+            self.execute_with_offload,
+            command,
+            capture_path,
+            max_inline_bytes=max_inline_bytes,
+            max_capture_bytes=max_capture_bytes,
+            timeout=timeout,
+        )
+
     # -- File operations with virtual-mode resolution & allow_prefixes ---------
 
     def write(self, file_path: str, content: str) -> WriteResult:
@@ -680,30 +784,37 @@ class KubernetesSandbox(BaseSandbox):
             return LsResult(error=str(exc))
         return super().ls(resolved)
 
-    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
         """Find files matching a glob pattern inside the sandbox.
 
         Args:
             pattern: Shell-style glob pattern (e.g. ``"*.py"``,
                 ``"**/*.json"``).
-            path: Base directory to search from.  Defaults to ``"/"``.
+            path: Base directory to search from.  ``None`` (default)
+                searches ``/``, or ``root_dir`` when ``virtual_mode`` is
+                enabled.  A supplied path is resolved through virtual mode.
 
         Returns:
             A :class:`~deepagents.backends.protocol.GlobResult` with
             matching file paths.  On failure ``error`` describes the
             reason.
         """
-        try:
-            resolved = self._resolve_virtual_path(path)
-        except ValueError as exc:
-            return GlobResult(error=str(exc))
-        return super().glob(pattern, resolved)
+        if path is not None:
+            try:
+                path = self._resolve_virtual_path(path)
+            except ValueError as exc:
+                return GlobResult(error=str(exc))
+        elif self._virtual_mode and self._root_dir is not None:
+            path = self._root_dir
+        return super().glob(pattern, path)
 
     def grep(
         self,
         pattern: str,
         path: str | None = None,
         glob: str | None = None,
+        *,
+        max_count: int | None = None,
     ) -> GrepResult:
         """Search for a text pattern inside sandbox files.
 
@@ -717,6 +828,10 @@ class KubernetesSandbox(BaseSandbox):
                 virtual mode).
             glob: Optional glob filter to restrict which files are
                 searched (e.g. ``"*.py"``).
+            max_count: Optional cap on the number of matches returned.
+                ``None`` returns every match.  Forwarded so the base
+                implementation can stop the search at the cap; the
+                middleware detects support by inspecting this signature.
 
         Returns:
             A :class:`~deepagents.backends.protocol.GrepResult` with
@@ -730,7 +845,78 @@ class KubernetesSandbox(BaseSandbox):
                 return GrepResult(error=str(exc))
         elif self._virtual_mode and self._root_dir is not None:
             path = self._root_dir
-        return super().grep(pattern, path, glob)
+        return super().grep(pattern, path, glob, max_count=max_count)
+
+    def delete(self, file_path: str) -> DeleteResult:
+        """Delete a file or directory inside the sandbox.
+
+        The path is resolved through virtual mode (if enabled) and
+        checked against the ``allow_prefixes`` policy before ``rm -rf``
+        runs inside the container.  ``BaseSandbox.delete`` applies no
+        path policy of its own.
+
+        Args:
+            file_path: Absolute or virtual path to delete.  Directories
+                are removed recursively.
+
+        Returns:
+            A :class:`~deepagents.backends.protocol.DeleteResult`.
+            On success ``error`` is ``None``; on failure it contains a
+            human-readable message.
+        """
+        try:
+            resolved = self._resolve_virtual_path(file_path)
+        except ValueError as exc:
+            logger.debug("delete: path resolution failed path=%r reason=%s", file_path, exc)
+            return DeleteResult(error=str(exc))
+        allow_error = self._check_allow_prefix(resolved)
+        if allow_error is not None:
+            logger.debug("delete: denied path=%r reason=%s", file_path, allow_error)
+            return DeleteResult(error=allow_error)
+        return super().delete(resolved)
+
+    # deepagents 0.7 implements these by calling ``aexecute`` directly, which
+    # skips the sync overrides above.  Routing back through them keeps
+    # ``allow_prefixes`` and ``virtual_mode`` on the async (``ainvoke``) path.
+    # ``aexecute``, ``adelete``, ``aupload_files`` and ``adownload_files``
+    # already delegate to the sync methods via ``asyncio.to_thread``.
+
+    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        """Async ``read`` that applies virtual-mode path resolution."""
+        return await asyncio.to_thread(self.read, file_path, offset, limit)
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        """Async ``write`` that applies path policy before uploading."""
+        return await asyncio.to_thread(self.write, file_path, content)
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,  # noqa: FBT001, FBT002
+    ) -> EditResult:
+        """Async ``edit`` that applies path policy before editing."""
+        return await asyncio.to_thread(self.edit, file_path, old_string, new_string, replace_all)
+
+    async def als(self, path: str) -> LsResult:
+        """Async ``ls`` that applies virtual-mode path resolution."""
+        return await asyncio.to_thread(self.ls, path)
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        *,
+        max_count: int | None = None,
+    ) -> GrepResult:
+        """Async ``grep`` that applies virtual-mode path resolution."""
+        return await asyncio.to_thread(self.grep, pattern, path, glob, max_count=max_count)
+
+    async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
+        """Async ``glob`` that applies virtual-mode path resolution."""
+        return await asyncio.to_thread(self.glob, pattern, path)
 
     # -- File transfer ---------------------------------------------------------
 
@@ -1073,6 +1259,8 @@ class KubernetesSandbox(BaseSandbox):
                     create_kwargs["pod_labels"] = self._pod_labels
                 if self._pod_annotations is not None:
                     create_kwargs["pod_annotations"] = self._pod_annotations
+                if self._env is not None:
+                    create_kwargs["env"] = self._env
                 self._sandbox = self._client.create_sandbox(**create_kwargs)
                 logger.info("Sandbox started: %s", self.id)
             self._started = True
@@ -1130,7 +1318,9 @@ class KubernetesSandbox(BaseSandbox):
 
     def _create_client(self) -> SandboxClient:
         """Build a new ``SandboxClient`` from stored configuration."""
-        from k8s_agent_sandbox import SandboxClient as _SandboxClient
+        # See the TYPE_CHECKING import: keep the package re-export so tests
+        # can patch ``k8s_agent_sandbox.SandboxClient``.
+        from k8s_agent_sandbox import SandboxClient as _SandboxClient  # pyright: ignore[reportPrivateImportUsage]
         from k8s_agent_sandbox.models import (
             SandboxDirectConnectionConfig,
             SandboxGatewayConnectionConfig,
@@ -1171,6 +1361,7 @@ def create_kubernetes_sandbox(
     pod_annotations: dict[str, str] | None = None,
     volume_claim_templates: list[dict[str, Any]] | None = None,
     shutdown_after_seconds: int | None = None,
+    env: dict[str, str] | None = None,
     sandbox_ready_timeout: int = 180,
     **kwargs: Any,
 ) -> KubernetesSandbox:
@@ -1229,6 +1420,9 @@ def create_kubernetes_sandbox(
             when reconnecting.
         shutdown_after_seconds: TTL in seconds after which the controller
             deletes the ``SandboxClaim``.  Ignored when reconnecting.
+        env: Environment variables written to ``spec.env``.  Forces a
+            cold start from the warm-pool template instead of adopting a
+            pre-warmed pod.  Ignored when reconnecting.
         sandbox_ready_timeout: Maximum seconds to wait for a newly created
             sandbox to become ready.  Defaults to 180.
         **kwargs: Additional keyword arguments forwarded to the
@@ -1304,6 +1498,8 @@ def create_kubernetes_sandbox(
                 create_claim_kwargs["volume_claim_templates"] = volume_claim_templates
             if shutdown_after_seconds is not None:
                 create_claim_kwargs["lifecycle"] = _lifecycle_spec(shutdown_after_seconds)
+            if env is not None:
+                create_claim_kwargs["env"] = env
             # Reuse the SDK's own builder so both creation paths apply
             # identical client-side label validation.
             pod_metadata = _build_pod_metadata(pod_labels, pod_annotations)

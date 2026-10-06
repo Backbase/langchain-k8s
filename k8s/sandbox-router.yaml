@@ -86,7 +86,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: router
-          image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandbox-router:v20260806-v0.5.4-10-g76ec022
+          image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandbox-router:v20260924-v1.0.4
           imagePullPolicy: IfNotPresent
           # No auth env vars here by design — see "Authentication" at the top
           # of this file.  The router will not start until either

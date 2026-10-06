@@ -1,0 +1,11 @@
+# Warm pool for the sandboxd template. replicas: 0 is a cold start: the CRD
+# defaults replicas to 1, so the field has to be explicit.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: sandboxd-pool
+  namespace: agent-sandbox-system
+spec:
+  sandboxTemplateRef:
+    name: sandboxd-template
+  replicas: 0

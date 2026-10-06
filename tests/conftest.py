@@ -1,6 +1,6 @@
 """Shared test fixtures for langchain-k8s.
 
-Mock compatibility verified against k8s-agent-sandbox >=0.5.4, whose claim
+Mock compatibility verified against k8s-agent-sandbox >=1.0.4, whose claim
 path is ``k8s_helper.get_sandbox_claim`` → ``create_sandbox_claim(name,
 warmpool, namespace, ...)`` → ``wait_for_claim_ready``, and whose
 ``SandboxClient.create_sandbox`` takes ``warmpool`` as its first parameter.

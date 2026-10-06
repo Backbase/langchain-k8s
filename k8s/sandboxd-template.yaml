@@ -1,0 +1,57 @@
+# SandboxTemplate running the sandboxd runtime (KEP-539.2).
+#
+# Commands execute in this container, so every tool the agent needs — including
+# python3, which BaseSandbox uses for read/write/edit/glob/grep — has to be in
+# the image. The staging tag latest-main does not include python3 (checked
+# against sha256:a6a7ffeb9a09). Shell execute works; the file tools do not.
+# kind-setup.sh does not apply this manifest. The image is an unpinned staging
+# build — pin a digest before using it anywhere but a local experiment.
+#
+# Reach it with SandboxdPodTunnelConnectionConfig, which port-forwards 8080
+# (REST) and 9090 (gRPC) straight to the pod. The sandbox-router cannot proxy
+# the gRPC ProcessService, so this template does not enable a Service.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: sandboxd-template
+  namespace: agent-sandbox-system
+spec:
+  podTemplate:
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 1000
+      containers:
+        - name: sandboxd
+          image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:latest-main
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          ports:
+            - containerPort: 8080
+            - containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: workspace
+          emptyDir: {}

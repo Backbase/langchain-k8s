@@ -20,9 +20,11 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CLUSTER_NAME="${CLUSTER_NAME:-langchain-k8s}"
 NAMESPACE="agent-sandbox-system"
-# Requires v0.5.2 or newer: the all-in-one release asset used below did not
-# exist before then, and the SDK talks v1beta1 only from v0.5.2 onward.
-AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.5.4}"
+# Requires v1.0.0 or newer. v1.0.0 removed the v1alpha1 API; a cluster that
+# still lists v1alpha1 in a CRD's status.storedVersions cannot take this
+# release directly — migrate on v0.5.x first. See
+# https://agent-sandbox.sigs.k8s.io/docs/getting_started/api-migration-guide/
+AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v1.0.4}"
 # Number of pre-warmed pods in the SandboxWarmPool.  0 (default) means pure
 # on-demand cold start; raise it to exercise or measure the warm path.
 WARMPOOL_REPLICAS="${WARMPOOL_REPLICAS:-0}"
@@ -85,9 +87,9 @@ RELEASE_URL="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/
 info "Installing agent-sandbox ${AGENT_SANDBOX_VERSION} (controller + extensions)"
 kubectl apply -f "${RELEASE_URL}/sandbox-with-extensions.yaml"
 
-# Must complete before any claim or warm pool is created: v1alpha1 is served
-# through a conversion webhook hosted by this controller, and resources
-# applied before it is serving fail with an opaque conversion error.
+# Must complete before any claim or warm pool is created. v1.0 dropped the
+# v1alpha1 conversion webhook, but a claim created before the controller is
+# ready still fails opaquely.
 info "Waiting for controller to be ready"
 kubectl rollout status deployment/agent-sandbox-controller \
     -n "${NAMESPACE}" --timeout=120s
@@ -158,7 +160,7 @@ kubectl get crd sandboxwarmpools.extensions.agents.x-k8s.io &>/dev/null \
 kubectl get crd sandboxclaims.extensions.agents.x-k8s.io \
     -o jsonpath='{.spec.versions[*].name}' 2>/dev/null | grep -q v1beta1 \
     && info "  ✓ sandboxclaims serves v1beta1" \
-    || error "  ✗ sandboxclaims does not serve v1beta1 — k8s-agent-sandbox >=0.5.2 will fail"
+    || error "  ✗ sandboxclaims does not serve v1beta1 — k8s-agent-sandbox >=1.0.4 will fail"
 
 info "Verifying warm pool"
 kubectl get sandboxwarmpool -n "${NAMESPACE}"
